@@ -1,0 +1,30 @@
+[
+  {
+    "id": 33,
+    "label": "1080p",
+    "type": "video/mp4",
+    "ext": "mp4",
+    "vcodec": "av1_nvenc",
+    "preset": "medium",
+    "profile": "main",
+    "ch": 2,
+    "vf": "scale=1920x1080",
+    "b_v": "3.5M",
+    "ar": "48k",
+    "gpu": true
+  },
+  {
+    "id": 34,
+    "label": "2160p",
+    "type": "video/mp4",
+    "ext": "mp4",
+    "vcodec": "av1_nvenc",
+    "preset": "slower",
+    "profile": "high",
+    "ch": 2,
+    "vf": "scale=3840x2160",
+    "b_v": "12M",
+    "ar": "48k",
+    "gpu": true
+  }
+]

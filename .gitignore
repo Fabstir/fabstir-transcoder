@@ -1,0 +1,46 @@
+# environment variables
+.env
+my-secret.yaml
+
+# Rust target directory
+*/target/
+
+*/path/to/file/*
+*/temp/to/transcode/*
+
+*/archive/
+/misc/
+
+# Rust build artifacts
+Cargo.toml.orig
+Cargo.toml.bk
+
+# Generated binary files
+*.exe
+*.exe.*
+*.dll
+*.so
+*.dylib
+
+# Generated documentation files
+*/doc/
+*/target/doc/
+
+# IDE-specific files
+*/.vscode/
+*/.idea/
+
+# Miscellaneous
+*.DS_Store
+*.log
+*.swp
+*.swo
+*~
+*.crt
+
+# tus_client
+tus_client/tests
+tus_client/target
+
+# protoc
+protoc/include/

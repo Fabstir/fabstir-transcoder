@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package transcode;
+
+message TranscodeRequest {
+    string source_cid = 1;
+    string media_formats = 2;
+    bool is_encrypted = 3;
+    bool is_gpu = 4;
+}
+
+message TranscodeResponse {
+    int32 status_code = 1;
+    string message = 2;
+    string task_id = 3;
+}
+
+service TranscodeService {
+    rpc Transcode(TranscodeRequest) returns (TranscodeResponse);
+
+    rpc GetTranscoded(GetTranscodedRequest) returns (GetTranscodedResponse);
+}
+
+message GetTranscodedRequest {
+    string task_id = 1;
+}
+
+message GetTranscodedResponse {
+    int32 status_code = 1;
+    string metadata = 2;
+    int32 progress = 3;
+}
