@@ -59,6 +59,7 @@ pub struct VideoFormat {
     gpu: Option<bool>,
     compression_level: Option<u8>,
     pub dest: Option<String>,
+    encrypt: Option<bool>,
 }
 
 fn add_arg(cmd: &mut Command, arg: &str, value: Option<&str>) {
@@ -170,6 +171,7 @@ fn run_ffmpeg(
     cmd.arg("-stats_period").arg("1");
 
     if is_gpu {
+        println!("GPU transcoding is being executed with vcodec: {:?}", format.vcodec);  
         add_arg(&mut cmd, "-i", Some(file_path));
         add_arg(&mut cmd, "-c:v", format.vcodec.as_deref());
         add_arg(&mut cmd, "-b:v", format.b_v.as_deref());
@@ -200,6 +202,7 @@ fn run_ffmpeg(
     } else {
         if let Some(vcodec) = &format.vcodec {
             if !vcodec.is_empty() {
+                println!("CPU transcoding is being executed with vcodec: {:?}", vcodec);                
                 add_arg(&mut cmd, "-i", Some(file_path));
                 add_arg(&mut cmd, "-c:v", format.vcodec.as_deref());
                 add_arg(&mut cmd, "-cpu-used", Some("4"));
@@ -321,30 +324,37 @@ pub async fn transcode_video(
         .to_string();
 
     let format = get_video_format_from_str(video_format)?;
-
+    
     let file_name = format!("{}_{}", file_name, format.id.to_string());
-
+    
     println!("Transcoding video: {}", &file_path);
     println!("is_gpu = {}", &is_gpu);
-
+    
     let total_duration = get_video_duration(file_path).unwrap_or_else(|_| 0.0);
     println!("Total video duration: {} seconds", total_duration);
-
+    
     let mut encryption_key1: Vec<u8> = Vec::new();
-
+    
     let response: TranscodeVideoResponse;
+    
+    // Use format.gpu if it has a value, otherwise use is_gpu
+    let gpu_flag = format.gpu.unwrap_or(is_gpu);
+    println!("transcode_video: gpu_flag: {}", gpu_flag);
 
+    let encrypt_flag = format.encrypt.unwrap_or(is_encrypted);
+    println!("transcode_video: encrypt_flag: {}", encrypt_flag);
+    
     run_ffmpeg(
         task_id,
         format_index,
         file_path,
         &file_name,
-        is_gpu,
+        gpu_flag,
         &format,
         total_duration,
     )?;
 
-    if is_encrypted {
+    if encrypt_flag {
         match encrypt_file_xchacha20(
             format!(
                 "{}{}_ue.{}",
