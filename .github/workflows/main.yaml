@@ -51,7 +51,7 @@ jobs:
           git config user.email "ammarkhaliq@gmail.com"
           git config user.name "Ammar Haider"
           short_sha=$(git rev-parse --short HEAD)
-          sed -i '' "s#ammarhaiderak.*#ammarhaiderak/fabstir-transcoder:${short_sha}#g" transcoder/deployment.yaml
+          sed -i "s#ammarhaiderak.*#ammarhaiderak/fabstir-transcoder:${short_sha}#g" transcoder/deployment.yaml
           git add -A
           git commit -am "Update image for ${short_sha}"
       - run: echo ${{ github }}
