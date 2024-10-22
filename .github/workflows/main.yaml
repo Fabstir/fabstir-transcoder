@@ -26,6 +26,11 @@ jobs:
       - name: Set outputs
         id: vars
         run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set env
+        run: | 
+          echo "${{secrets.ENV_FILE}}" > .env
+          echo "${{secrets.ENV_FILE}}" > transcode_server/.env
       
       - name: Build and push
         uses: docker/build-push-action@v2
