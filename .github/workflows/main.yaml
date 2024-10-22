@@ -48,6 +48,9 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.G_TOKEN }}
     steps:
+      - name: Set outputs
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
       - uses: actions/checkout@v3
         with:
           repository: ammarhaiderak/gitops-fabstir
