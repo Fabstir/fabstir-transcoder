@@ -48,9 +48,6 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.G_TOKEN }}
     steps:
-      - name: Set outputs
-        id: vars
-        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
       - uses: actions/checkout@v3
         with:
           repository: ammarhaiderak/gitops-fabstir
@@ -60,8 +57,10 @@ jobs:
         run: |
           git config user.email "ammarkhaliq@gmail.com"
           git config user.name "Ammar Haider"
-          # short_sha=$(git rev-parse --short HEAD)
-          sed -i "s#ammarhaiderak.*#ammarhaiderak/fabstir-transcoder:${{steps.vars.outputs.sha_short}}#g" transcoder/deployment.yaml
+          short_sha=${{jobs.build-and-push-docke.steps.vars.outputs.sha_short}}
+          echo "short_sha: $short_sha"
+          #$(git rev-parse --short HEAD)
+          sed -i "s#ammarhaiderak.*#ammarhaiderak/fabstir-transcoder:${short_sha}#g" transcoder/deployment.yaml
           git add -A
           git commit -am "Update image for ${short_sha}"
       - name: Pushing Updated Image Tag
