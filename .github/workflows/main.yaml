@@ -41,6 +41,8 @@ jobs:
 
       - name: Image Digest
         run: echo ${{ steps.docker_build.outputs.digest }}
+    outputs:  # Define the output of the job
+      short_sha: ${{ steps.vars.outputs.sha_short }}
   
   update-manifest:
     runs-on: ubuntu-latest
@@ -57,7 +59,7 @@ jobs:
         run: |
           git config user.email "ammarkhaliq@gmail.com"
           git config user.name "Ammar Haider"
-          short_sha=${{jobs.build-and-push-docke.steps.vars.outputs.sha_short}}
+          short_sha=${{needs.build-and-push-docker.outputs.sha_short}}
           echo "short_sha: $short_sha"
           #$(git rev-parse --short HEAD)
           sed -i "s#ammarhaiderak.*#ammarhaiderak/fabstir-transcoder:${short_sha}#g" transcoder/deployment.yaml
