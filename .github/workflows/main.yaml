@@ -32,7 +32,7 @@ jobs:
         uses: docker/build-push-action@v2
         with:
           context: ./
-          tags: ammarhaiderak/fabstir-transcoder:${{ github.sha }}
+          tags: ewr.vultrcr.com/fabstir/transcoder:${{ github.sha }}
           push: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Image Digest
@@ -41,23 +41,19 @@ jobs:
   update-manifest:
     runs-on: ubuntu-latest
     needs: ['build-and-push-docker']
-    env:
-      GITHUB_TOKEN: ${{ secrets.G_TOKEN }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
-          repository: ammarhaiderak/gitops-fabstir
+          repository: Fabstir/gitops-fabstir-media-player
           ref: 'main'
-          token: ${{ secrets.G_TOKEN }}
+          ssh-key: ${{ secrets.GITOPS_REPO_SSH_PRIVATE_KEY }}
       - name: Setup Git Config
         run: |
           git config user.email "ammarkhaliq@gmail.com"
           git config user.name "Ammar Haider"
-          sed -i "s#ammarhaiderak.*#ammarhaiderak/fabstir-transcoder:${{github.sha}}#g" transcoder/deployment.yaml
+          sed -i "s#ewr.vultrcr.com.*#ewr.vultrcr.com/transcoder:${{github.sha}}#g" transcoder/deployment.yaml
           git add -A
-          git commit -am "Update image for ${short_sha}"
+          git commit -am "Update image for ${{github.sha}}"
       - name: Pushing Updated Image Tag
-        run: |
-          export GITHUB_TOKEN=${{ secrets.G_TOKEN }}
-          git push origin main
+        run: git push origin main
           
