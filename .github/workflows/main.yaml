@@ -52,7 +52,7 @@ jobs:
         run: |
           git config user.email "ammarkhaliq@gmail.com"
           git config user.name "Ammar Haider"
-          sed -i "s#ewr.vultrcr.com.*#ewr.vultrcr.com/transcoder:${{github.sha}}#g" transcoder/deployment.yaml
+          sed -i "s#ewr.vultrcr.com.*#ewr.vultrcr.com/fabstir/transcoder:${{github.sha}}#g" transcoder/deployment.yaml
           git add -A
           git commit -am "Update image for ${{github.sha}}"
       - name: Pushing Updated Image Tag
