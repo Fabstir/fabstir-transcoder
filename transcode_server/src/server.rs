@@ -12,6 +12,7 @@
  */
 
 mod s5;
+mod auth;
 
 mod encrypt_file;
 
@@ -732,6 +733,7 @@ async fn main() {
 
     let transcode_handler = Arc::clone(&rest_handler);
     let transcode = warp::path!("transcode")
+    .and(auth::with_auth()) // Apply JWT authentication middleware
         .and(warp::query::<QueryParams>())
         .and_then(move |params: QueryParams| {
             let rest_handler = Arc::clone(&transcode_handler);
@@ -751,6 +753,7 @@ async fn main() {
 
     let get_transcoded_handler = Arc::clone(&rest_handler);
     let get_transcoded = warp::path!("get_transcoded" / String)
+    .and(auth::with_auth()) // Apply JWT authentication middleware
         .and_then(move |task_id| {
             let rest_handler = Arc::clone(&get_transcoded_handler);
             async move { rest_handler.get_transcoded(task_id).await }
