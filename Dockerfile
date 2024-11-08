@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.67 as build
+FROM rust:1.72 as build
 
 WORKDIR /usr/src/transcode-example
 
@@ -31,12 +31,12 @@ COPY transcode_server/proto ./proto
 RUN cargo build --release --bin transcode-server
 
 # Runtime stage
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 WORKDIR /usr/local/bin
 
 RUN apt-get update && \
-  apt-get install -y ffmpeg && \
+  apt-get install -y build-essential pkg-config libssl-dev ffmpeg && \
   apt-get install -y openssl ca-certificates
 
 # Copy the root CA certificate to the container
@@ -56,5 +56,5 @@ EXPOSE 50051
 # Export LD_LIBRARY_PATH 
 ENV LD_LIBRARY_PATH=/usr/local/bin 
 
-# Set transode-server binary as entrypoint 
+# Set transode-server binary as entrypoint
 ENTRYPOINT ["./transcode-server"]
