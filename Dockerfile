@@ -36,8 +36,14 @@ FROM debian:bookworm-slim
 WORKDIR /usr/local/bin
 
 RUN apt-get update && \
-  apt-get install -y build-essential pkg-config libssl-dev ffmpeg && \
-  apt-get install -y openssl ca-certificates
+  apt-get install -y build-essential pkg-config libssl-dev && \
+  apt-get install -y openssl ca-certificates curl libaom-dev libsvtav1-dev python3-launchpadlib
+
+RUN curl -L https://us.download.nvidia.com/tesla/565.57.01/nvidia-driver-local-repo-debian12-565.57.01_1.0-1_amd64.deb --output driver.deb
+
+RUN cp /var/nvidia-driver-local-repo-debian12-565.57.01/nvidia-driver-local-CAD411B2-keyring.gpg /usr/share/keyrings/
+
+RUN apt-get install -y ./driver.deb ffmpeg && rm driver.deb
 
 # Copy the root CA certificate to the container
 RUN echo "$S5_ROOT_CA" > /usr/local/share/ca-certificates/s5-root-ca.crt \
