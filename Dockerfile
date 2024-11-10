@@ -41,9 +41,9 @@ RUN apt-get update && \
 
 RUN curl -L https://us.download.nvidia.com/tesla/565.57.01/nvidia-driver-local-repo-debian12-565.57.01_1.0-1_amd64.deb --output driver.deb
 
-RUN cp /var/nvidia-driver-local-repo-debian12-565.57.01/nvidia-driver-local-CAD411B2-keyring.gpg /usr/share/keyrings/
-
 RUN apt-get install -y ./driver.deb ffmpeg && rm driver.deb
+
+RUN cp /var/nvidia-driver-local-repo-debian12-565.57.01/nvidia-driver-local-CAD411B2-keyring.gpg /usr/share/keyrings/
 
 # Copy the root CA certificate to the container
 RUN echo "$S5_ROOT_CA" > /usr/local/share/ca-certificates/s5-root-ca.crt \
