@@ -36,7 +36,7 @@ FROM nvidia/cuda:12.6.2-devel-ubuntu22.04
 WORKDIR /usr/local/bin
 
 RUN apt-get update && \
-  apt-get install -y build-essential yasm cmake pkg-config libssl-dev \
+  apt-get install -y build-essential nasm yasm cmake pkg-config libssl-dev \
   git openssl ca-certificates curl libaom-dev libsvtav1-dev python3-launchpadlib \
   libtool libc6 libc6-dev unzip wget libnuma1 libnuma-dev 
   # ffmpeg
