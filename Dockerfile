@@ -42,17 +42,19 @@ RUN apt-get update && \
 
 COPY ./install-script.sh ./install-script.sh
 
-RUN chmod +x ./install-script.sh && ./install-script.sh
+RUN chmod +x ./install-script.sh
+
+RUN ./install-script.sh
 
 
-# installing ffmpeg with cuda enabled
-RUN git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git \
-  && cd nv-codec-headers && make install && cd - \
-  && git clone https://git.ffmpeg.org/ffmpeg.git \
-  && cd ffmpeg/ \
-  && ./configure --prefix=/usr --enable-nonfree --enable-cuda-nvcc --enable-libnpp --extra-cflags=-I/usr/local/cuda/include --extra-ldflags=-L/usr/local/cuda/lib64 --disable-static --enable-shared \
-  && make -j 8 \
-  && make install && ldconfig
+# # installing ffmpeg with cuda enabled
+# RUN git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git \
+#   && cd nv-codec-headers && make install && cd - \
+#   && git clone https://git.ffmpeg.org/ffmpeg.git \
+#   && cd ffmpeg/ \
+#   && ./configure --prefix=/usr --enable-nonfree --enable-cuda-nvcc --enable-libnpp --extra-cflags=-I/usr/local/cuda/include --extra-ldflags=-L/usr/local/cuda/lib64 --disable-static --enable-shared \
+#   && make -j 8 \
+#   && make install && ldconfig
 
 # Copy the root CA certificate to the container
 RUN echo "$S5_ROOT_CA" > /usr/local/share/ca-certificates/s5-root-ca.crt \
