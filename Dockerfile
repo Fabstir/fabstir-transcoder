@@ -31,19 +31,28 @@ COPY transcode_server/proto ./proto
 RUN cargo build --release --bin transcode-server
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM nvidia/cuda:12.6.2-base-ubuntu22.04
 
 WORKDIR /usr/local/bin
 
 RUN apt-get update && \
-  apt-get install -y build-essential pkg-config libssl-dev && \
-  apt-get install -y openssl ca-certificates curl libaom-dev libsvtav1-dev python3-launchpadlib
+  apt-get install -y build-essential yasm cmake pkg-config libssl-dev \
+  git openssl ca-certificates curl libaom-dev libsvtav1-dev python3-launchpadlib \
+  libtool libc6 libc6-dev unzip wget libnuma1 libnuma-dev ffmpeg
 
-RUN curl -L https://us.download.nvidia.com/tesla/565.57.01/nvidia-driver-local-repo-debian12-565.57.01_1.0-1_amd64.deb --output driver.deb
+COPY ./install-script.sh ./install-script.sh
 
-RUN apt-get install -y ./driver.deb ffmpeg && rm driver.deb
+RUN chmod +x ./install-script.sh && ./install-script.sh
 
-RUN cp /var/nvidia-driver-local-repo-debian12-565.57.01/nvidia-driver-local-CAD411B2-keyring.gpg /usr/share/keyrings/
+
+# installing ffmpeg with cuda enabled
+RUN git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git \
+  && cd nv-codec-headers && make install && cd - \
+  && git clone https://git.ffmpeg.org/ffmpeg.git \
+  && cd ffmpeg/ \
+  && ./configure --prefix=/usr --enable-nonfree --enable-cuda-nvcc --enable-libnpp --extra-cflags=-I/usr/local/cuda/include --extra-ldflags=-L/usr/local/cuda/lib64 --disable-static --enable-shared \
+  && make -j 8 \
+  && make install && ldconfig
 
 # Copy the root CA certificate to the container
 RUN echo "$S5_ROOT_CA" > /usr/local/share/ca-certificates/s5-root-ca.crt \
@@ -56,11 +65,12 @@ RUN mkdir -p ./temp/to/transcode && chmod 777 ./temp/to/transcode
 # Copy transode-server binary from build stage 
 COPY --from=build /usr/src/transcode-example/transcode_server/target/release/transcode-server .
 
-# Expose port 50051 
-EXPOSE 50051 
+# Expose port 
+EXPOSE 50051
+EXPOSE 8000
 
-# Export LD_LIBRARY_PATH 
-ENV LD_LIBRARY_PATH=/usr/local/bin 
+# # Export LD_LIBRARY_PATH 
+# ENV LD_LIBRARY_PATH=/usr/local/bin 
 
 # Set transode-server binary as entrypoint
 ENTRYPOINT ["./transcode-server"]
