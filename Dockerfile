@@ -44,7 +44,7 @@ COPY ./install-script.sh ./install-script.sh
 
 RUN chmod +x ./install-script.sh
 
-RUN ./install-script.sh
+RUN bash ./install-script.sh
 
 
 # # installing ffmpeg with cuda enabled

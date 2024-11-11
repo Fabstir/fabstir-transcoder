@@ -1,3 +1,5 @@
+#!/bin/bash
+
 echo 'if [ -d "/usr/local/cuda-12.6.2/bin" ] ; then
     PATH="/usr/local/cuda-12.6.2/bin:$PATH"
 fi
