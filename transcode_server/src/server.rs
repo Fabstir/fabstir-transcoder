@@ -322,7 +322,7 @@ async fn transcode_task_receiver(
                         let url = format!("{}{}{}", *IPFS_GATEWAY, "/ipfs/", source_cid);
 
                         match download_video(&url, file_path.as_str()).await {
-                            Ok(_) => println!("Video downloaded successfully"),
+                            Ok(_) => println!("Video downloaded successfully from URL: {}", url),
                             Err(e) => {
                                 eprintln!("Failed to download video from URL {}: {}", &url, e);
                                 continue;
@@ -334,7 +334,7 @@ async fn transcode_task_receiver(
                         let url = format!("{}{}{}", portal_url, "/s5/blob/", source_cid);
 
                         match download_video(&url, file_path.as_str()).await {
-                            Ok(_) => println!("Video downloaded successfully"),
+                            Ok(_) => println!("Video downloaded successfully from URL: {}", url),
                             Err(e) => {
                                 eprintln!("Failed to download video from URL {}: {}", &url, e);
                                 continue;

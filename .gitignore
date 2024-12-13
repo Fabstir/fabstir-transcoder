@@ -44,3 +44,5 @@ tus_client/target
 
 # protoc
 protoc/include/
+.vscode/launch.json
+.vscode/tasks.json

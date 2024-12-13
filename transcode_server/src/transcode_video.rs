@@ -52,6 +52,8 @@ pub struct VideoFormat {
     ch: Option<u8>,
     vf: Option<String>,
     b_v: Option<String>,
+    c_a: Option<String>,
+    b_a: Option<String>,
     ar: Option<String>,
     minrate: Option<String>,
     maxrate: Option<String>,
@@ -171,17 +173,32 @@ fn run_ffmpeg(
     cmd.arg("-stats_period").arg("1");
 
     if is_gpu {
-        println!("GPU transcoding is being executed with vcodec: {:?}", format.vcodec);  
-        add_arg(&mut cmd, "-i", Some(file_path));
-        add_arg(&mut cmd, "-c:v", format.vcodec.as_deref());
-        add_arg(&mut cmd, "-b:v", format.b_v.as_deref());
-        add_arg(&mut cmd, "-c:a", Some("libopus"));
-        add_arg(&mut cmd, "-b:a", Some("192k"));
+        println!("GPU transcoding is being executed with vcodec: {:?}", format.vcodec);
+
+        if let Some(file_path) = Some(file_path) {
+            add_arg(&mut cmd, "-i", Some(file_path));
+        }
+        if let Some(vcodec) = format.vcodec.as_deref() {
+            add_arg(&mut cmd, "-c:v", Some(vcodec));
+        }
+        if let Some(b_v) = format.b_v.as_deref() {
+            add_arg(&mut cmd, "-b:v", Some(b_v));
+        }
+        if let Some(c_a) = format.c_a.as_deref() {
+            add_arg(&mut cmd, "-c:a", Some(c_a));
+        }
+        if let Some(b_a) = format.b_a.as_deref() {
+            add_arg(&mut cmd, "-b:a", Some(b_a));
+        }
         if let Some(ch) = format.ch {
             add_arg(&mut cmd, "-ac", Some(&ch.to_string()));
         }
-        add_arg(&mut cmd, "-ar", format.ar.as_deref());
-        add_arg(&mut cmd, "-vf", format.vf.as_deref());
+        if let Some(ar) = format.ar.as_deref() {
+            add_arg(&mut cmd, "-ar", Some(ar));
+        }
+        if let Some(vf) = format.vf.as_deref() {
+            add_arg(&mut cmd, "-vf", Some(vf));
+        }
         if let Some(ref minrate) = format.minrate {
             cmd.args(["-minrate", minrate]);
         }
@@ -199,29 +216,77 @@ fn run_ffmpeg(
             )
             .as_str(),
         ]);
+    
+        // Convert to Vec<String> instead of Vec<Cow<'_, str>>
+        let args: Vec<String> = cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        println!("ffmpeg {}", args.join(" "));
+        
+        // Now String implements AsRef<OsStr>
+        for arg in args {
+            cmd.arg(arg);
+        }
     } else {
         if let Some(vcodec) = &format.vcodec {
             if !vcodec.is_empty() {
-                println!("CPU transcoding is being executed with vcodec: {:?}", vcodec);                
-                add_arg(&mut cmd, "-i", Some(file_path));
-                add_arg(&mut cmd, "-c:v", format.vcodec.as_deref());
+
+                println!("CPU transcoding is being executed with vcodec: {:?}", format.vcodec);
+
                 add_arg(&mut cmd, "-cpu-used", Some("4"));
-                add_arg(&mut cmd, "-b:v", format.b_v.as_deref());
-                add_arg(&mut cmd, "-crf", Some("30"));
-                add_arg(&mut cmd, "-c:a", Some("libopus"));
-                add_arg(&mut cmd, "-b:a", Some("192k"));
+
+                if let Some(file_path) = Some(file_path) {
+                    add_arg(&mut cmd, "-i", Some(file_path));
+                }
+                if let Some(vcodec) = format.vcodec.as_deref() {
+                    add_arg(&mut cmd, "-c:v", Some(vcodec));
+                }
+                if let Some(b_v) = format.b_v.as_deref() {
+                    add_arg(&mut cmd, "-b:v", Some(b_v));
+                }
+                if let Some(c_a) = format.c_a.as_deref() {
+                    add_arg(&mut cmd, "-c:a", Some(c_a));
+                }
+                if let Some(b_a) = format.b_a.as_deref() {
+                    add_arg(&mut cmd, "-b:a", Some(b_a));
+                }
                 if let Some(ch) = format.ch {
                     add_arg(&mut cmd, "-ac", Some(&ch.to_string()));
                 }
-                add_arg(&mut cmd, "-vf", format.vf.as_deref());
-                add_arg(
-                    &mut cmd,
+                if let Some(ar) = format.ar.as_deref() {
+                    add_arg(&mut cmd, "-ar", Some(ar));
+                }
+                if let Some(vf) = format.vf.as_deref() {
+                    add_arg(&mut cmd, "-vf", Some(vf));
+                }
+                if let Some(ref minrate) = format.minrate {
+                    cmd.args(["-minrate", minrate]);
+                }
+                if let Some(ref maxrate) = format.maxrate {
+                    cmd.args(["-maxrate", maxrate]);
+                }
+                if let Some(ref bufsize) = format.bufsize {
+                    cmd.args(["-bufsize", bufsize]);
+                }
+                cmd.args([
                     "-y",
-                    Some(&format!(
+                    format!(
                         "{}{}_ue.{}",
                         *PATH_TO_TRANSCODED_FILE, file_name, format.ext
-                    )),
-                );
+                    )
+                    .as_str(),
+                ]);
+            
+                // Convert to Vec<String> instead of Vec<Cow<'_, str>>
+                let args: Vec<String> = cmd.get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect();
+                println!("ffmpeg {}", args.join(" "));
+                
+                // Now String implements AsRef<OsStr>
+                for arg in args {
+                    cmd.arg(arg);
+                }
             } else {
                 return Err(Status::new(
                     Code::InvalidArgument,
