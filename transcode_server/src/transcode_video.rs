@@ -41,6 +41,29 @@ pub struct TranscodeVideoResponse {
     pub cid: String,
 }
 
+/// Represents the configuration for video transcoding format settings.
+/// This struct defines various parameters used by FFmpeg for video and audio transcoding.
+///
+/// # Fields
+/// * `id` - Unique identifier for the format configuration
+/// * `ext` - Output file extension (e.g., "mp4", "webm")
+/// * `vcodec` - Video codec (e.g., "h264_nvenc" for GPU encoding)
+/// * `acodec` - Audio codec (e.g., "aac", "libopus")
+/// * `preset` - Encoding preset for speed/quality tradeoff
+/// * `profile` - Encoding profile (e.g., "high", "main")
+/// * `ch` - Number of audio channels
+/// * `vf` - Video filter string
+/// * `b_v` - Video bitrate
+/// * `c_a` - Audio codec
+/// * `b_a` - Audio bitrate
+/// * `ar` - Audio sample rate
+/// * `minrate` - Minimum video bitrate
+/// * `maxrate` - Maximum video bitrate
+/// * `bufsize` - Video buffer size
+/// * `gpu` - Whether to use GPU acceleration
+/// * `compression_level` - Audio compression level
+/// * `dest` - Destination path for the transcoded file
+/// * `encrypt` - Whether to encrypt the output file
 #[derive(Debug, Deserialize)]
 pub struct VideoFormat {
     pub id: u32,
