@@ -31,7 +31,7 @@ COPY transcode_server/proto ./proto
 RUN cargo build --release --bin transcode-server
 
 # Runtime stage
-FROM nvidia/cuda:12.6.2-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
 
 WORKDIR /usr/local/bin
 

@@ -1,11 +1,11 @@
 #!/bin/bash
 
-echo 'if [ -d "/usr/local/cuda-12.6.2/bin" ] ; then
-    PATH="/usr/local/cuda-12.6.2/bin:$PATH"
+echo 'if [ -d "/usr/local/cuda-12.8.0/bin" ] ; then
+    PATH="/usr/local/cuda-12.8.0/bin:$PATH"
 fi
 
-if [ -d "/usr/local/cuda-12.6.2/lib64" ] ; then
-    LD_LIBRARY_PATH="/usr/local/cuda-12.6.2/lib64:$LD_LIBRARY_PATH"
+if [ -d "/usr/local/cuda-12.8.0/lib64" ] ; then
+    LD_LIBRARY_PATH="/usr/local/cuda-12.8.0/lib64:$LD_LIBRARY_PATH"
 fi
 
 if [ -d "/usr/local/lib" ] ; then
