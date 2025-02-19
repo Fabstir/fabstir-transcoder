@@ -20,6 +20,10 @@ use tus_client::Client;
 use utils::bytes_to_base64url;
 
 pub fn download_file(url: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+//    // Print the values of the input variables
+//    println!("download_file: Downloading file from URL: {}", url);
+//    println!("download_file: Saving file to path: {}", path);
+
     // Create a new client with default configuration
     let client = reqwest::Client::new();
 
