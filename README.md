@@ -190,3 +190,24 @@ Note that `dest` can be specfied for each output format type as either "s5" for 
 The transcoder now checks to see if a source media file has already been downloaded. If so and it is still available in its cache area, it will not download again but use the local version. Similarly, if a file for a specific media format has already been transcoded and is still available in the cache area, then transcoding of the source media file for that particular format will be skipped and the local version uploaded instead.
 
 In the `.env` file, set FILE_SIZE_THRESHOLD and TRANSCODED_FILE_SIZE_THRESHOLD to the size in bytes, above which files in the cache get deleted; starting from oldest file first. GARBAGE_COLLECTOR_INTERVAL is the polling frequency in seconds for how often these thresholds are checked.
+
+
+# Deployment on k8
+
+There are few things to take into consideration when deploying this service on k8:
+
+1. The kuberenetes Node has to support GPU (with encoder), A16 Nvidia GPU should suffice
+2. The pod in order to utilize the GPU properly has to have `nvidia-smi` 
+3. installation of ffmpeg with `--enable-cuda-nvcc`
+```
+git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git \
+  && cd nv-codec-headers && make install && cd - \
+  && git clone https://git.ffmpeg.org/ffmpeg.git \
+  && cd ffmpeg/ \
+  && ./configure --prefix=/usr --enable-nonfree --enable-cuda-nvcc --enable-libnpp --extra-cflags=-I/usr/local/cuda/include --extra-ldflags=-L/usr/local/cuda/lib64 --disable-static --enable-shared \
+  && make -j 8 \
+  && make install && ldconfig
+```
+4. the env variable `NVIDIA_DRIVER_CAPABILITIES=video,compute,utility`
+5. for multiple pods the env variables `PATH_TO_FILE=/mnt/shared-wd/path/to/file/` and `PATH_TO_TRANSCODED_FILE=/mnt/shared-wd/temp/to/transcode/` should point to shared mounted directories, so multiple pods access same working directory.
+If those are set to local directory of the pod, it is quite possible that when transcoding job is distributed, the transcoded output won't be accessible to other pods.
