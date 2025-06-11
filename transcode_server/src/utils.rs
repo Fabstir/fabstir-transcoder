@@ -96,8 +96,6 @@ pub async fn download_and_concat_files(
     data: String,
     file_path: String,
 ) -> Result<(), Box<dyn Error>> {
-    println!("download_and_concat_files - metadata: {}", data);
-    
     // Parse the JSON data
     let json_data: JsonData = serde_json::from_str(&data)?;
     
@@ -110,7 +108,7 @@ pub async fn download_and_concat_files(
     if let Some(parent) = Path::new(&file_path).parent() {
         fs::create_dir_all(parent).await?;
     }
-
+    
     // Open the final file
     let mut final_file = OpenOptions::new()
         .create(true)
@@ -119,67 +117,99 @@ pub async fn download_and_concat_files(
         .open(&file_path)
         .expect("Failed to open final_file");
     
-    let mut total_bytes_written = 0;
+    // Get parts to download (all if only one exists, all except last if multiple exist)
+    let parts = &json_data.locations[0].parts;
+    let content_parts = if parts.len() > 1 {
+        &parts[..parts.len()-1]  // Skip last part only if multiple parts exist
+    } else {
+        parts  // Use all parts if only one exists
+    };
     
-    // Process each location
-    'location_loop: for (location_index, location) in json_data.locations.iter().enumerate() {
-        println!("Processing location {}: {} parts", location_index, location.parts.len());
+    let mut total_bytes_written = 0;
+    const MAX_RETRIES: usize = 3;
+    
+    // Process each content part
+    for part in content_parts {
+        let path_to_file = var("PATH_TO_FILE").unwrap();
+        let tmp_file_path = String::from(path_to_file.to_owned() + &sanitize(part.as_str()));
         
-        // Try each part in this location
-        for (part_index, part) in location.parts.iter().enumerate() {
-            // Skip obviously invalid URLs
-            if part.len() < 10 || !part.contains('/') {
-                println!("Skipping invalid URL: {}", part);
-                continue;
+        let mut success = false;
+        let mut retry_count = 0;
+        
+        // Retry loop for each part
+        while !success && retry_count < MAX_RETRIES {
+            if retry_count > 0 {
+                println!("Retrying download (attempt {}/{}): {}", retry_count + 1, MAX_RETRIES, part);
+                // Add exponential backoff delay
+                tokio::time::sleep(std::time::Duration::from_millis(500 * 2_u64.pow(retry_count as u32))).await;
             }
             
-            // More strict URL validation - must contain domain and path
-            let url_parts: Vec<&str> = part.split('/').collect();
-            if url_parts.len() < 4 || url_parts[3].is_empty() {
-                // URL should have at least protocol, empty string, domain, and some path
-                // e.g., "https://example.com/path" splits into ["https:", "", "example.com", "path"]
-                println!("Skipping URL with no file path: {}", part);
-                continue;
-            }
-            
-            println!("Trying to download part {}: {}", part_index, part);
-            
-            // Create a temporary file path
-            let path_to_file = var("PATH_TO_FILE").unwrap_or_else(|_| "./tmp/".to_string());
-            let tmp_file_path = format!("{}{}", path_to_file, sanitize(&format!("part_{}", part_index)));
-            
-            // Try to download the file
-            if let Ok(_) = download_video(&part, &tmp_file_path).await {
-                // Check if the file was downloaded successfully
-                if let Ok(metadata) = fs::metadata(&tmp_file_path).await {
-                    let file_size = metadata.len();
-                    println!("Downloaded part size: {} bytes", file_size);
-                    
-                    if file_size > 0 {
-                        // Read and append the file content
-                        if let Ok(mut downloaded_file) = fs::File::open(&tmp_file_path).await {
-                            let mut buffer = Vec::new();
-                            if let Ok(bytes_read) = downloaded_file.read_to_end(&mut buffer).await {
-                                if bytes_read > 0 {
-                                    if final_file.write_all(&buffer).is_ok() {
-                                        total_bytes_written += bytes_read;
-                                        println!("Successfully appended {} bytes", bytes_read);
+            match download_video(&part, tmp_file_path.as_str()).await {
+                Ok(_) => {
+                    // Verify the downloaded file has content
+                    match fs::metadata(&tmp_file_path).await {
+                        Ok(metadata) => {
+                            let file_size = metadata.len();
+                            println!("Downloaded part size: {} bytes", file_size);
+                            
+                            if file_size == 0 {
+                                println!("Warning: Downloaded file is empty, retrying...");
+                                retry_count += 1;
+                                continue;
+                            }
+                            
+                            // Read and append file content
+                            match fs::File::open(&tmp_file_path).await {
+                                Ok(mut downloaded_file) => {
+                                    let mut buffer = Vec::new();
+                                    if let Ok(bytes_read) = downloaded_file.read_to_end(&mut buffer).await {
+                                        if bytes_read > 0 {
+                                            match final_file.write_all(&buffer) {
+                                                Ok(_) => {
+                                                    total_bytes_written += bytes_read;
+                                                    success = true;
+                                                    println!("Successfully appended {} bytes", bytes_read);
+                                                },
+                                                Err(e) => {
+                                                    eprintln!("Failed to write to final file: {}", e);
+                                                    retry_count += 1;
+                                                }
+                                            }
+                                        } else {
+                                            println!("Warning: Read 0 bytes from downloaded file, retrying...");
+                                            retry_count += 1;
+                                        }
+                                    } else {
+                                        eprintln!("Failed to read downloaded file");
+                                        retry_count += 1;
                                     }
+                                },
+                                Err(e) => {
+                                    eprintln!("Failed to open downloaded file: {}", e);
+                                    retry_count += 1;
                                 }
                             }
+                        },
+                        Err(e) => {
+                            eprintln!("Failed to get metadata for downloaded file: {}", e);
+                            retry_count += 1;
                         }
                     }
-                }
-                
-                // Clean up temporary file
-                let _ = std::fs::remove_file(&tmp_file_path);
-                
-                // If we successfully downloaded and processed a part, move to the next location
-                if total_bytes_written > 0 {
-                    println!("Successfully downloaded content from location {}", location_index);
-                    continue 'location_loop;
+                },
+                Err(e) => {
+                    eprintln!("Download error: {}", e);
+                    retry_count += 1;
                 }
             }
+            
+            // Clean up regardless of success
+            if std::path::Path::new(&tmp_file_path).exists() {
+                let _ = std::fs::remove_file(&tmp_file_path);
+            }
+        }
+        
+        if !success {
+            return Err(format!("Failed to download part after {} retries: {}", MAX_RETRIES, part).into());
         }
     }
     
