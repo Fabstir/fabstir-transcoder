@@ -1,0 +1,63 @@
+# =============================================================================
+# Fabstir Transcoder — Docker Compose for Dev Container
+# =============================================================================
+# Spin up:   docker compose up -d
+# Connect:   docker compose exec dev bash
+# Stop:      docker compose down
+#
+# Auth option A — API key (no browser needed):
+#   Create a .env file with ANTHROPIC_API_KEY=sk-ant-...
+#
+# Auth option B — OAuth (Pro/Max subscription):
+#   Just run `claude` — it walks you through browser-based login.
+#   Credentials persist across restarts via named volumes.
+# =============================================================================
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: fabstir-transcoder-dev
+    user: dev
+    stdin_open: true          # keep STDIN open (-i)
+    tty: true                 # allocate a pseudo-TTY (-t)
+
+    # Mount the project source into /workspace
+    volumes:
+      - .:/workspace
+
+      # Persist Cargo registry + git cache across rebuilds
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+
+      # Persist Rust build artefacts (target/) so rebuilds are incremental
+      - cargo-target:/workspace/transcode_server/target
+
+      # Persist Claude Code config + data so you don't re-auth every time
+      - claude-config:/home/dev/.claude
+      - claude-data:/home/dev/.local/share/claude
+
+    # Pass your Anthropic API key at runtime (preferred over hardcoding).
+    # Set it in a .env file next to this compose file or export it in your shell.
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+
+      # If your project needs these at dev time, uncomment and set:
+      # - S5_ROOT_CA=${S5_ROOT_CA:-}
+      # - PORTAL_URL=${PORTAL_URL:-}
+
+    # Expose the transcoder's gRPC + HTTP ports for local testing
+    ports:
+      - "50051:50051"
+      - "8000:8000"
+
+    # Keep the container running
+    command: ["bash"]
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:
+  claude-config:
+  claude-data:

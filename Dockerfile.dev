@@ -1,0 +1,104 @@
+# =============================================================================
+# Fabstir Transcoder — Dev Container for Claude Code
+# =============================================================================
+# This image provides the full Rust/ffmpeg development environment plus
+# everything needed to install and run the Claude Code CLI interactively.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose exec dev bash
+#   claude                          # launch Claude Code inside the container
+# =============================================================================
+
+FROM rust:1.86-bookworm
+
+LABEL maintainer="Fabstir"
+LABEL description="Dev container for fabstir-transcoder with Claude Code support"
+
+# Avoid interactive prompts during apt installs
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── System dependencies (Rust project + ffmpeg + protobuf) ──────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build essentials
+    build-essential \
+    pkg-config \
+    cmake \
+    nasm \
+    yasm \
+    sudo \
+    # Protobuf (needed by tonic/prost for gRPC)
+    protobuf-compiler \
+    # SSL / TLS
+    libssl-dev \
+    ca-certificates \
+    openssl \
+    # ffmpeg and codec libraries
+    ffmpeg \
+    libaom-dev \
+    libsvtav1-dev \
+    # General dev utilities
+    git \
+    curl \
+    wget \
+    vim \
+    ripgrep \
+    fd-find \
+    jq \
+    unzip \
+    libnuma-dev \
+    # Python (useful for scripting / tooling)
+    python3 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Rust tooling ────────────────────────────────────────────────────────────
+# The base image already has rustup + stable toolchain.
+# Add common dev components.
+RUN rustup component add \
+    clippy \
+    rustfmt \
+    rust-analyzer
+
+# Cargo helpers (optional but useful with Claude Code)
+# Installed separately so a single crate failure doesn't block the build.
+RUN cargo install cargo-watch || true
+RUN cargo install cargo-expand || true
+
+# Protobuf env var expected by the build
+ENV PROTOC=/usr/bin/protoc
+
+# ── Node.js 22 LTS (required for Claude Code CLI) ──────────────────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Non-root user ──────────────────────────────────────────────────────────
+# Claude Code refuses --dangerously-skip-permissions as root.
+# Create a dev user with passwordless sudo for when you need it.
+ARG USERNAME=dev
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+RUN groupadd --gid ${USER_GID} ${USERNAME} \
+    && useradd --uid ${USER_UID} --gid ${USER_GID} -m -s /bin/bash ${USERNAME} \
+    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
+    && chmod 0440 /etc/sudoers.d/${USERNAME}
+
+# Give the dev user access to the Rust toolchain installed by the base image
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+RUN chmod -R a+rw ${RUSTUP_HOME} ${CARGO_HOME}
+
+# ── Claude Code CLI (installed as the dev user) ────────────────────────────
+USER ${USERNAME}
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Ensure claude binary + cargo bins are on PATH
+ENV PATH="/home/${USERNAME}/.local/bin:/usr/local/cargo/bin:${PATH}"
+
+# ── Workspace ───────────────────────────────────────────────────────────────
+WORKDIR /workspace
+
+# Keep the container alive so you can exec into it
+CMD ["bash"]
