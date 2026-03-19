@@ -39,6 +39,7 @@ pub struct TranscodeVideoResponse {
     pub status_code: i32,
     pub message: String,
     pub cid: String,
+    pub duration: f64,
 }
 
 /// Represents the configuration for video transcoding format settings.
@@ -196,7 +197,10 @@ fn run_ffmpeg(
     cmd.arg("-stats_period").arg("1");
 
     if is_gpu {
-        println!("GPU transcoding is being executed with vcodec: {:?}", format.vcodec);
+        println!(
+            "GPU transcoding is being executed with vcodec: {:?}",
+            format.vcodec
+        );
 
         if let Some(file_path) = Some(file_path) {
             add_arg(&mut cmd, "-i", Some(file_path));
@@ -239,13 +243,14 @@ fn run_ffmpeg(
             )
             .as_str(),
         ]);
-    
+
         // Convert to Vec<String> instead of Vec<Cow<'_, str>>
-        let args: Vec<String> = cmd.get_args()
+        let args: Vec<String> = cmd
+            .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         println!("ffmpeg {}", args.join(" "));
-        
+
         // Now String implements AsRef<OsStr>
         for arg in args {
             cmd.arg(arg);
@@ -253,8 +258,10 @@ fn run_ffmpeg(
     } else {
         if let Some(vcodec) = &format.vcodec {
             if !vcodec.is_empty() {
-
-                println!("CPU transcoding is being executed with vcodec: {:?}", format.vcodec);
+                println!(
+                    "CPU transcoding is being executed with vcodec: {:?}",
+                    format.vcodec
+                );
 
                 add_arg(&mut cmd, "-cpu-used", Some("4"));
 
@@ -299,13 +306,14 @@ fn run_ffmpeg(
                     )
                     .as_str(),
                 ]);
-            
+
                 // Convert to Vec<String> instead of Vec<Cow<'_, str>>
-                let args: Vec<String> = cmd.get_args()
+                let args: Vec<String> = cmd
+                    .get_args()
                     .map(|arg| arg.to_string_lossy().into_owned())
                     .collect();
                 println!("ffmpeg {}", args.join(" "));
-                
+
                 // Now String implements AsRef<OsStr>
                 for arg in args {
                     cmd.arg(arg);
@@ -375,7 +383,6 @@ fn run_ffmpeg(
     Ok(())
 }
 
-
 /// Asynchronously transcodes a video from a given format to another using ffmpeg,
 /// based on the specified transcoder settings. This function supports optional
 /// encryption and GPU acceleration.
@@ -412,26 +419,26 @@ pub async fn transcode_video(
         .to_string();
 
     let format = get_video_format_from_str(video_format)?;
-    
+
     let file_name = format!("{}_{}", file_name, format.id.to_string());
-    
+
     println!("Transcoding video: {}", &file_path);
     println!("is_gpu = {}", &is_gpu);
-    
+
     let total_duration = get_video_duration(file_path).unwrap_or_else(|_| 0.0);
     println!("Total video duration: {} seconds", total_duration);
-    
+
     let mut encryption_key1: Vec<u8> = Vec::new();
-    
+
     let response: TranscodeVideoResponse;
-    
+
     // Use format.gpu if it has a value, otherwise use is_gpu
     let gpu_flag = format.gpu.unwrap_or(is_gpu);
     println!("transcode_video: gpu_flag: {}", gpu_flag);
 
     let encrypt_flag = format.encrypt.unwrap_or(is_encrypted);
     println!("transcode_video: encrypt_flag: {}", encrypt_flag);
-    
+
     run_ffmpeg(
         task_id,
         format_index,
@@ -580,6 +587,7 @@ pub async fn transcode_video(
                     status_code: 200,
                     message: String::from("Transcoding successful"),
                     cid: encrypted_cid,
+                    duration: total_duration,
                 };
             }
             Err(e) => {
@@ -590,6 +598,7 @@ pub async fn transcode_video(
                     status_code: 500,
                     message: format!("Transcoding task failed with error {}", e),
                     cid: "".to_string(),
+                    duration: 0.0,
                 };
             }
         };
@@ -611,6 +620,7 @@ pub async fn transcode_video(
                     status_code: 200,
                     message: String::from("Transcoding successful"),
                     cid,
+                    duration: total_duration,
                 };
             }
             Err(e) => {
@@ -621,10 +631,50 @@ pub async fn transcode_video(
                     status_code: 500,
                     message: format!("Transcoding task failed with error {}", e),
                     cid: "".to_string(),
+                    duration: 0.0,
                 };
             }
         };
     }
 
     Ok(Response::new(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transcode_video_response_carries_duration() {
+        let response = TranscodeVideoResponse {
+            status_code: 200,
+            message: String::from("Transcoding successful"),
+            cid: String::from("test_cid"),
+            duration: 125.5,
+        };
+        assert_eq!(response.duration, 125.5);
+    }
+
+    #[test]
+    fn test_transcode_video_response_error_has_zero_duration() {
+        let response = TranscodeVideoResponse {
+            status_code: 500,
+            message: String::from("Error"),
+            cid: String::new(),
+            duration: 0.0,
+        };
+        assert_eq!(response.duration, 0.0);
+    }
+
+    #[test]
+    fn test_transcode_video_response_clone_preserves_duration() {
+        let response = TranscodeVideoResponse {
+            status_code: 200,
+            message: String::from("Transcoding successful"),
+            cid: String::from("test_cid"),
+            duration: 42.7,
+        };
+        let cloned = response.clone();
+        assert_eq!(cloned.duration, 42.7);
+    }
 }

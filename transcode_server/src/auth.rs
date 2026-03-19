@@ -1,8 +1,8 @@
-use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
+use dotenv::var;
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use warp::reject::custom;
 use warp::{Filter, Rejection};
-use dotenv::var;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Claims {
@@ -14,7 +14,7 @@ struct Claims {
 struct InvalidToken;
 
 /// Creates a Warp filter for JWT authentication.
-/// 
+///
 /// This function extracts the `Authorization` header from the incoming request,
 /// verifies the JWT token, and ensures it matches the expected token stored in
 /// the `FABSTIR_TRANSCODER_JWT` environment variable. It also decodes and validates
@@ -22,7 +22,7 @@ struct InvalidToken;
 /// environment variable.
 ///
 /// # Returns
-/// 
+///
 /// A Warp filter that verifies the JWT token and either continues the request
 /// if the token is valid or rejects it with an `InvalidToken` rejection.
 impl warp::reject::Reject for InvalidToken {}

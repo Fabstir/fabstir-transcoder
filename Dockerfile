@@ -68,12 +68,15 @@ RUN mkdir -p ./temp/to/transcode && chmod 777 ./temp/to/transcode
 # Copy transode-server binary from build stage 
 COPY --from=build /usr/src/transcode-example/transcode_server/target/release/transcode-server .
 
-# Expose port 
+# Expose ports
 EXPOSE 50051
 EXPOSE 8000
 
-# # Export LD_LIBRARY_PATH 
-# ENV LD_LIBRARY_PATH=/usr/local/bin 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
 
-# Set transode-server binary as entrypoint
+# # Export LD_LIBRARY_PATH
+# ENV LD_LIBRARY_PATH=/usr/local/bin
+
+# Set transcode-server binary as entrypoint
 ENTRYPOINT ["./transcode-server"]

@@ -46,3 +46,6 @@ tus_client/target
 protoc/include/
 .vscode/launch.json
 .vscode/tasks.json
+
+docs/development/
+docs/temp/

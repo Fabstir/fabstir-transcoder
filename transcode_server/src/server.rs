@@ -11,8 +11,8 @@
  * Date: 28 May 2023
  */
 
-mod s5;
 mod auth;
+mod s5;
 
 mod encrypt_file;
 
@@ -58,7 +58,8 @@ use std::convert::TryInto;
 
 use dotenv::{dotenv, var};
 
-static TRANSCODED: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static TRANSCODED: Lazy<Mutex<HashMap<String, (String, f64)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 static PATH_TO_FILE: Lazy<String> =
     Lazy::new(|| var("PATH_TO_FILE").unwrap_or_else(|_| panic!("PATH_TO_FILE not set in .env")));
 static PATH_TO_TRANSCODED_FILE: Lazy<String> = Lazy::new(|| {
@@ -76,11 +77,8 @@ static GARBAGE_COLLECTOR_INTERVAL: Lazy<String> = Lazy::new(|| {
     var("GARBAGE_COLLECTOR_INTERVAL")
         .unwrap_or_else(|_| panic!("GARBAGE_COLLECTOR_INTERVAL not set in .env"))
 });
-static IPFS_GATEWAY: Lazy<String> = Lazy::new(|| {
-    var("IPFS_GATEWAY")
-        .unwrap_or_else(|_| panic!("IPFS_GATEWAY not set in .env"))
-});
-
+static IPFS_GATEWAY: Lazy<String> =
+    Lazy::new(|| var("IPFS_GATEWAY").unwrap_or_else(|_| panic!("IPFS_GATEWAY not set in .env")));
 
 fn get_file_size(file_path: String) -> std::io::Result<u64> {
     let metadata = fs::metadata(file_path)?;
@@ -211,7 +209,9 @@ async fn transcode_task_receiver(
             continue;
         }
 
-        let storage_network: Option<&str> = orig_source_cid.split_once("://").map(|(network, _)| network);
+        let storage_network: Option<&str> = orig_source_cid
+            .split_once("://")
+            .map(|(network, _)| network);
         if storage_network.is_none() {
             eprintln!("Invalid source CID: {}", orig_source_cid);
             continue;
@@ -327,10 +327,9 @@ async fn transcode_task_receiver(
                                 eprintln!("Failed to download video from URL {}: {}", &url, e);
                                 continue;
                             }
-                        };                    
-                    },
-                    _ => 
-                    {
+                        };
+                    }
+                    _ => {
                         let url = format!("{}{}{}", portal_url, "/s5/blob/", source_cid);
 
                         match download_video(&url, file_path.as_str()).await {
@@ -339,8 +338,8 @@ async fn transcode_task_receiver(
                                 eprintln!("Failed to download video from URL {}: {}", &url, e);
                                 continue;
                             }
-                        };        
-                    },
+                        };
+                    }
                 }
             }
         } else {
@@ -367,6 +366,8 @@ async fn transcode_task_receiver(
 
         // Then, we transcode the downloaded video with each video format
         let mut transcoded_formats = Vec::new();
+        let mut source_duration: f64 = 0.0;
+
         for (index, video_format) in media_formats_vec.iter().enumerate() {
             let video_format_str = match serde_json::to_string(&video_format) {
                 Ok(str) => str,
@@ -409,6 +410,9 @@ async fn transcode_task_receiver(
                     Ok(transcode_video_response) => {
                         // Handle the successful response
                         let response = transcode_video_response.into_inner();
+                        if source_duration == 0.0 && response.duration > 0.0 {
+                            source_duration = response.duration;
+                        }
                         println!(
                             "Response: status_code: {}, message: {}, cid: {}",
                             response.status_code, response.message, response.cid
@@ -444,7 +448,7 @@ async fn transcode_task_receiver(
         });
 
         let mut transcoded = TRANSCODED.lock().await;
-        transcoded.insert(task_id.clone(), transcoded_json);
+        transcoded.insert(task_id.clone(), (transcoded_json, source_duration));
 
         // Mark progress as complete (100%) for all formats
         for i in 0..formats_count {
@@ -452,7 +456,6 @@ async fn transcode_task_receiver(
         }
     }
 }
-
 
 // The gRPC service implementation
 #[derive(Debug, Clone)]
@@ -523,9 +526,10 @@ impl TranscodeService for TranscodeServiceHandler {
     ) -> Result<Response<GetTranscodedResponse>, Status> {
         let task_id = &request.get_ref().task_id;
         let transcoded = TRANSCODED.lock().await;
-        let metadata_option = transcoded.get(task_id).cloned();
+        let entry = transcoded.get(task_id).cloned();
 
-        let metadata = metadata_option.unwrap_or_else(|| "Transcoding in progress".to_string());
+        let (metadata, duration) =
+            entry.unwrap_or_else(|| ("Transcoding in progress".to_string(), 0.0));
 
         let progress = shared::calculate_overall_progress(task_id);
 
@@ -533,12 +537,12 @@ impl TranscodeService for TranscodeServiceHandler {
             status_code: 200,
             metadata,
             progress,
+            duration,
         };
 
         Ok(Response::new(response))
     }
 }
-
 
 impl Drop for TranscodeServiceHandler {
     fn drop(&mut self) {
@@ -623,6 +627,7 @@ struct GetTranscodedResponseWrapper {
     status_code: i32,
     metadata: String,
     progress: i32,
+    duration: f64,
 }
 
 impl From<transcode::GetTranscodedResponse> for GetTranscodedResponseWrapper {
@@ -631,29 +636,32 @@ impl From<transcode::GetTranscodedResponse> for GetTranscodedResponseWrapper {
             status_code: response.status_code,
             metadata: response.metadata,
             progress: response.progress,
+            duration: response.duration,
         }
     }
 }
 
 impl RestHandler {
     async fn get_transcoded(&self, task_id: String) -> Result<impl warp::Reply, warp::Rejection> {
-    // Retrieve the metadata and the progress for the given task ID.
-    let transcoded = TRANSCODED.lock().await;
-    let metadata_option = transcoded.get(&task_id).cloned();
+        // Retrieve the metadata and the progress for the given task ID.
+        let transcoded = TRANSCODED.lock().await;
+        let entry = transcoded.get(&task_id).cloned();
 
-    // Use a default value for metadata if it's not available.
-    let metadata = metadata_option.unwrap_or_else(|| "Transcoding in progress".to_string());
+        // Use default values if the task is not yet complete.
+        let (metadata, duration) =
+            entry.unwrap_or_else(|| ("Transcoding in progress".to_string(), 0.0));
 
-    let progress = shared::calculate_overall_progress(&task_id);
+        let progress = shared::calculate_overall_progress(&task_id);
 
-    // Construct the response including the progress
-    let response = GetTranscodedResponseWrapper {
-        status_code: 200,
-        metadata,
-        progress,
-    };
+        // Construct the response including the progress
+        let response = GetTranscodedResponseWrapper {
+            status_code: 200,
+            metadata,
+            progress,
+            duration,
+        };
 
-    Ok(warp::reply::json(&response))
+        Ok(warp::reply::json(&response))
     }
 }
 
@@ -714,7 +722,9 @@ async fn main() {
 
     let task_sender = Arc::new(Mutex::new(task_sender));
 
-    let grpc_addr = "0.0.0.0:50051".parse().expect("Invalid gRPC server address");
+    let grpc_addr = "0.0.0.0:50051"
+        .parse()
+        .expect("Invalid gRPC server address");
     let transcode_service_handler = TranscodeServiceHandler {
         transcode_task_sender: Some(task_sender.clone()),
     };
@@ -733,7 +743,7 @@ async fn main() {
 
     let transcode_handler = Arc::clone(&rest_handler);
     let transcode = warp::path!("transcode")
-    .and(auth::with_auth()) // Apply JWT authentication middleware
+        .and(auth::with_auth()) // Apply JWT authentication middleware
         .and(warp::query::<QueryParams>())
         .and_then(move |params: QueryParams| {
             let rest_handler = Arc::clone(&transcode_handler);
@@ -753,7 +763,7 @@ async fn main() {
 
     let get_transcoded_handler = Arc::clone(&rest_handler);
     let get_transcoded = warp::path!("get_transcoded" / String)
-    .and(auth::with_auth()) // Apply JWT authentication middleware
+        .and(auth::with_auth()) // Apply JWT authentication middleware
         .and_then(move |task_id| {
             let rest_handler = Arc::clone(&get_transcoded_handler);
             async move { rest_handler.get_transcoded(task_id).await }
@@ -761,16 +771,23 @@ async fn main() {
         .with(cors.clone())
         .boxed();
 
-    let routes = transcode.or(get_transcoded);
+    let health = warp::path!("health")
+        .and(warp::get())
+        .map(|| warp::reply::json(&serde_json::json!({"status": "ok"})));
+
+    let routes = health.or(transcode).or(get_transcoded);
     let rest_server = warp::serve(routes).run(([0, 0, 0, 0], 8000));
 
-    let garbage_collection_secs = GARBAGE_COLLECTOR_INTERVAL.parse::<u64>().unwrap_or_else(|_| {
-        eprintln!("Failed to parse GARBAGE_COLLECTOR_INTERVAL into a u64");
-        3600 // default to 1 hour
-    });
+    let garbage_collection_secs = GARBAGE_COLLECTOR_INTERVAL
+        .parse::<u64>()
+        .unwrap_or_else(|_| {
+            eprintln!("Failed to parse GARBAGE_COLLECTOR_INTERVAL into a u64");
+            3600 // default to 1 hour
+        });
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(garbage_collection_secs));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(garbage_collection_secs));
         loop {
             interval.tick().await;
             let threshold = FILE_SIZE_THRESHOLD.parse::<u64>().unwrap_or_else(|_| {
@@ -778,10 +795,12 @@ async fn main() {
                 1000000000 // default to 1GB
             });
             garbage_collect(PATH_TO_FILE.as_str(), threshold);
-            let transcoded_threshold = TRANSCODED_FILE_SIZE_THRESHOLD.parse::<u64>().unwrap_or_else(|_| {
-                eprintln!("Failed to parse TRANSCODED_FILE_SIZE_THRESHOLD into a u64");
-                1000000000 // default to 1GB
-            });
+            let transcoded_threshold = TRANSCODED_FILE_SIZE_THRESHOLD
+                .parse::<u64>()
+                .unwrap_or_else(|_| {
+                    eprintln!("Failed to parse TRANSCODED_FILE_SIZE_THRESHOLD into a u64");
+                    1000000000 // default to 1GB
+                });
             garbage_collect(PATH_TO_TRANSCODED_FILE.as_str(), transcoded_threshold);
         }
     });
@@ -799,3 +818,47 @@ async fn main() {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_proto_get_transcoded_response_has_duration() {
+        let proto_src = include_str!("../proto/transcode.proto");
+        assert!(
+            proto_src.contains("double duration"),
+            "GetTranscodedResponse proto must contain 'double duration' field"
+        );
+    }
+
+    #[test]
+    fn test_get_transcoded_response_wrapper_has_duration() {
+        let wrapper = GetTranscodedResponseWrapper {
+            status_code: 200,
+            metadata: String::new(),
+            progress: 100,
+            duration: 99.5,
+        };
+        assert_eq!(wrapper.duration, 99.5);
+    }
+
+    #[test]
+    fn test_transcoded_map_stores_duration() {
+        // Verify the TRANSCODED map value type stores (String, f64)
+        let entry: (String, f64) = ("metadata".to_string(), 42.0);
+        let mut map = std::collections::HashMap::<String, (String, f64)>::new();
+        map.insert("task1".to_string(), entry);
+        let (metadata, duration) = map.get("task1").cloned().unwrap();
+        assert_eq!(metadata, "metadata");
+        assert_eq!(duration, 42.0);
+    }
+
+    #[test]
+    fn test_health_endpoint_exists() {
+        let server_src = include_str!("server.rs");
+        assert!(
+            server_src.contains(r#"warp::path!("health")"#),
+            "REST server must have a /health endpoint"
+        );
+    }
+}

@@ -1,0 +1,79 @@
+# =============================================================================
+# Fabstir Transcoder — Production Docker Compose Reference
+# =============================================================================
+# Reference configuration for integrating the transcoder as a sidecar service.
+# Adapt env vars and volumes to your deployment.
+#
+# Image: ewr.vultrcr.com/fabstir/transcoder:{sha}
+# REST API: port 8000 (JWT-authenticated)
+# gRPC API: port 50051
+# Health: GET http://localhost:8000/health (unauthenticated, returns {"status":"ok"})
+#
+# REST Endpoints:
+#   POST /transcode?source_cid=...&media_formats=...&is_encrypted=...&is_gpu=...
+#   GET  /get_transcoded/{task_id}
+#        Response: { "status_code": 200, "metadata": "...", "progress": 0-100, "duration": <seconds> }
+# =============================================================================
+
+services:
+  transcoder:
+    image: ewr.vultrcr.com/fabstir/transcoder:${TRANSCODER_IMAGE_SHA:?Set TRANSCODER_IMAGE_SHA}
+    restart: unless-stopped
+    ports:
+      - "8000:8000"     # REST API
+      # - "50051:50051" # Uncomment if gRPC access is needed
+    environment:
+      # -- S5 / Storage --
+      PORTAL_URL: ${PORTAL_URL:?Required}              # S5 gateway URL
+      PORTAL_ENCRYPT_URL: ${PORTAL_ENCRYPT_URL:-}       # S5 encrypted gateway URL (if using encryption)
+      TOKEN: ${S5_TOKEN:?Required}                      # S5 authentication token
+
+      # -- IPFS (optional, for ipfs:// CIDs) --
+      IPFS_GATEWAY: ${IPFS_GATEWAY:-}                   # IPFS gateway URL
+
+      # -- File paths (container-internal) --
+      PATH_TO_FILE: /data/downloads/                     # Temp dir for downloaded source files
+      PATH_TO_TRANSCODED_FILE: /data/transcoded/         # Temp dir for transcoded output files
+
+      # -- Transcoding config --
+      MEDIA_FORMATS_FILE: /config/video_formats.json     # Path to video format definitions
+
+      # -- Cache / garbage collection --
+      FILE_SIZE_THRESHOLD: ${FILE_SIZE_THRESHOLD:-1000000000}                 # Source cache cleanup threshold (bytes, default 1GB)
+      TRANSCODED_FILE_SIZE_THRESHOLD: ${TRANSCODED_FILE_SIZE_THRESHOLD:-1000000000}  # Transcoded cache threshold (bytes, default 1GB)
+      GARBAGE_COLLECTOR_INTERVAL: ${GARBAGE_COLLECTOR_INTERVAL:-3600}         # Cache cleanup interval (seconds, default 1h)
+
+      # -- Authentication --
+      FABSTIR_TRANSCODER_JWT: ${FABSTIR_TRANSCODER_JWT:?Required}            # JWT token for API authentication
+      FABSTIR_TRANSCODER_SECRET_KEY: ${FABSTIR_TRANSCODER_SECRET_KEY:?Required}  # Secret key for JWT verification
+
+      # -- GPU (optional) --
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,video}
+
+    volumes:
+      # Temp storage for source downloads and transcoded files
+      - transcoder-downloads:/data/downloads
+      - transcoder-output:/data/transcoded
+
+      # Video format config (mount your custom formats file here)
+      - ./config/video_formats.json:/config/video_formats.json:ro
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # Uncomment for GPU acceleration (requires nvidia-container-toolkit)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  transcoder-downloads:
+  transcoder-output:

@@ -29,4 +29,5 @@ message GetTranscodedResponse {
     int32 status_code = 1;
     string metadata = 2;
     int32 progress = 3;
+    double duration = 4;
 }

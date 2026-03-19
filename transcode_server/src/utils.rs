@@ -10,8 +10,8 @@ use serde_json;
 use std::error::Error;
 use std::fs::metadata;
 use std::fs::{File, OpenOptions};
-use std::path::Path;
 use std::io::Write;
+use std::path::Path;
 
 use tokio::fs;
 use tokio::io::AsyncReadExt;
@@ -98,17 +98,17 @@ pub async fn download_and_concat_files(
 ) -> Result<(), Box<dyn Error>> {
     // Parse the JSON data
     let json_data: JsonData = serde_json::from_str(&data)?;
-    
+
     // Ensure we have at least one location with parts
     if json_data.locations.is_empty() || json_data.locations[0].parts.is_empty() {
         return Err("No file parts found in metadata".into());
     }
-    
+
     // Create parent directory if it doesn't exist
     if let Some(parent) = Path::new(&file_path).parent() {
         fs::create_dir_all(parent).await?;
     }
-    
+
     // Open the final file
     let mut final_file = OpenOptions::new()
         .create(true)
@@ -116,34 +116,42 @@ pub async fn download_and_concat_files(
         .truncate(true)
         .open(&file_path)
         .expect("Failed to open final_file");
-    
+
     // Get parts to download (all if only one exists, all except last if multiple exist)
     let parts = &json_data.locations[0].parts;
     let content_parts = if parts.len() > 1 {
-        &parts[..parts.len()-1]  // Skip last part only if multiple parts exist
+        &parts[..parts.len() - 1] // Skip last part only if multiple parts exist
     } else {
-        parts  // Use all parts if only one exists
+        parts // Use all parts if only one exists
     };
-    
+
     let mut total_bytes_written = 0;
     const MAX_RETRIES: usize = 3;
-    
+
     // Process each content part
     for part in content_parts {
         let path_to_file = var("PATH_TO_FILE").unwrap();
         let tmp_file_path = String::from(path_to_file.to_owned() + &sanitize(part.as_str()));
-        
+
         let mut success = false;
         let mut retry_count = 0;
-        
+
         // Retry loop for each part
         while !success && retry_count < MAX_RETRIES {
             if retry_count > 0 {
-                println!("Retrying download (attempt {}/{}): {}", retry_count + 1, MAX_RETRIES, part);
+                println!(
+                    "Retrying download (attempt {}/{}): {}",
+                    retry_count + 1,
+                    MAX_RETRIES,
+                    part
+                );
                 // Add exponential backoff delay
-                tokio::time::sleep(std::time::Duration::from_millis(500 * 2_u64.pow(retry_count as u32))).await;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    500 * 2_u64.pow(retry_count as u32),
+                ))
+                .await;
             }
-            
+
             match download_video(&part, tmp_file_path.as_str()).await {
                 Ok(_) => {
                     // Verify the downloaded file has content
@@ -151,27 +159,35 @@ pub async fn download_and_concat_files(
                         Ok(metadata) => {
                             let file_size = metadata.len();
                             println!("Downloaded part size: {} bytes", file_size);
-                            
+
                             if file_size == 0 {
                                 println!("Warning: Downloaded file is empty, retrying...");
                                 retry_count += 1;
                                 continue;
                             }
-                            
+
                             // Read and append file content
                             match fs::File::open(&tmp_file_path).await {
                                 Ok(mut downloaded_file) => {
                                     let mut buffer = Vec::new();
-                                    if let Ok(bytes_read) = downloaded_file.read_to_end(&mut buffer).await {
+                                    if let Ok(bytes_read) =
+                                        downloaded_file.read_to_end(&mut buffer).await
+                                    {
                                         if bytes_read > 0 {
                                             match final_file.write_all(&buffer) {
                                                 Ok(_) => {
                                                     total_bytes_written += bytes_read;
                                                     success = true;
-                                                    println!("Successfully appended {} bytes", bytes_read);
-                                                },
+                                                    println!(
+                                                        "Successfully appended {} bytes",
+                                                        bytes_read
+                                                    );
+                                                }
                                                 Err(e) => {
-                                                    eprintln!("Failed to write to final file: {}", e);
+                                                    eprintln!(
+                                                        "Failed to write to final file: {}",
+                                                        e
+                                                    );
                                                     retry_count += 1;
                                                 }
                                             }
@@ -183,41 +199,45 @@ pub async fn download_and_concat_files(
                                         eprintln!("Failed to read downloaded file");
                                         retry_count += 1;
                                     }
-                                },
+                                }
                                 Err(e) => {
                                     eprintln!("Failed to open downloaded file: {}", e);
                                     retry_count += 1;
                                 }
                             }
-                        },
+                        }
                         Err(e) => {
                             eprintln!("Failed to get metadata for downloaded file: {}", e);
                             retry_count += 1;
                         }
                     }
-                },
+                }
                 Err(e) => {
                     eprintln!("Download error: {}", e);
                     retry_count += 1;
                 }
             }
-            
+
             // Clean up regardless of success
             if std::path::Path::new(&tmp_file_path).exists() {
                 let _ = std::fs::remove_file(&tmp_file_path);
             }
         }
-        
+
         if !success {
-            return Err(format!("Failed to download part after {} retries: {}", MAX_RETRIES, part).into());
+            return Err(format!(
+                "Failed to download part after {} retries: {}",
+                MAX_RETRIES, part
+            )
+            .into());
         }
     }
-    
+
     // Final verification
     if total_bytes_written == 0 {
         return Err("No data was written to the output file".into());
     }
-    
+
     println!("Total bytes written: {}", total_bytes_written);
     Ok(())
 }
