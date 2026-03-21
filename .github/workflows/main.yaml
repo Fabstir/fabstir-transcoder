@@ -35,6 +35,8 @@ jobs:
           context: ./
           tags: ewr.vultrcr.com/fabstir/transcoder:${{ github.sha }}
           push: ${{ github.ref == 'refs/heads/main' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Image Digest
         run: echo ${{ steps.docker_build.outputs.digest }}
