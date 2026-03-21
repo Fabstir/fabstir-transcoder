@@ -65,6 +65,7 @@ pub struct TranscodeVideoResponse {
 /// * `compression_level` - Audio compression level
 /// * `dest` - Destination path for the transcoded file
 /// * `encrypt` - Whether to encrypt the output file
+/// * `trim_percent` - Keep only the first N% of duration (1–99); used for preview clips
 #[derive(Debug, Deserialize)]
 pub struct VideoFormat {
     pub id: u32,
@@ -86,6 +87,7 @@ pub struct VideoFormat {
     compression_level: Option<u8>,
     pub dest: Option<String>,
     encrypt: Option<bool>,
+    trim_percent: Option<u8>,
 }
 
 fn add_arg(cmd: &mut Command, arg: &str, value: Option<&str>) {
@@ -196,6 +198,16 @@ fn run_ffmpeg(
     cmd.arg("-progress").arg("pipe:2");
     cmd.arg("-stats_period").arg("1");
 
+    let trim_duration: Option<f64> = format.trim_percent.and_then(|pct| {
+        if pct >= 1 && pct <= 99 && total_duration > 0.0 {
+            Some(total_duration * (pct as f64) / 100.0)
+        } else {
+            None
+        }
+    });
+    // Progress should track against trimmed duration, not full source
+    let progress_duration = trim_duration.unwrap_or(total_duration);
+
     if is_gpu {
         println!(
             "GPU transcoding is being executed with vcodec: {:?}",
@@ -234,6 +246,9 @@ fn run_ffmpeg(
         }
         if let Some(ref bufsize) = format.bufsize {
             cmd.args(["-bufsize", bufsize]);
+        }
+        if let Some(td) = trim_duration {
+            cmd.args(["-t", &format!("{:.3}", td)]);
         }
         cmd.args([
             "-y",
@@ -298,6 +313,9 @@ fn run_ffmpeg(
                 if let Some(ref bufsize) = format.bufsize {
                     cmd.args(["-bufsize", bufsize]);
                 }
+                if let Some(td) = trim_duration {
+                    cmd.args(["-t", &format!("{:.3}", td)]);
+                }
                 cmd.args([
                     "-y",
                     format!(
@@ -339,6 +357,9 @@ fn run_ffmpeg(
                         Some(&compression_level.to_string()),
                     );
                 }
+                if let Some(td) = trim_duration {
+                    cmd.args(["-t", &format!("{:.3}", td)]);
+                }
                 add_arg(
                     &mut cmd,
                     "-y",
@@ -367,7 +388,7 @@ fn run_ffmpeg(
         let mut last_progress = 0;
         for line_result in reader.lines() {
             if let Ok(line) = line_result {
-                if let Some(progress) = parse_progress(&line, total_duration) {
+                if let Some(progress) = parse_progress(&line, progress_duration) {
                     last_progress = progress;
                     shared::update_progress(&task_id, format_index, last_progress);
                 }
@@ -676,5 +697,71 @@ mod tests {
         };
         let cloned = response.clone();
         assert_eq!(cloned.duration, 42.7);
+    }
+
+    #[test]
+    fn test_video_format_deserializes_trim_percent() {
+        let json = r#"{"id": 1, "ext": "mp4", "trim_percent": 20}"#;
+        let format: VideoFormat = serde_json::from_str(json).unwrap();
+        assert_eq!(format.trim_percent, Some(20));
+    }
+
+    #[test]
+    fn test_video_format_trim_percent_absent_is_none() {
+        let json = r#"{"id": 1, "ext": "mp4"}"#;
+        let format: VideoFormat = serde_json::from_str(json).unwrap();
+        assert!(format.trim_percent.is_none());
+    }
+
+    #[test]
+    fn test_trim_duration_calculation() {
+        let cases: Vec<(f64, u8, f64)> =
+            vec![(120.0, 20, 24.0), (60.0, 50, 30.0), (200.5, 10, 20.05)];
+        for (total, pct, expected) in cases {
+            let result = total * (pct as f64) / 100.0;
+            assert!(
+                (result - expected).abs() < 1e-10,
+                "{total} * {pct}% = {result}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_trim_percent_edge_cases_skipped() {
+        let compute = |pct: u8, dur: f64| -> Option<f64> {
+            Some(pct).and_then(|p| {
+                if p >= 1 && p <= 99 && dur > 0.0 {
+                    Some(dur * (p as f64) / 100.0)
+                } else {
+                    None
+                }
+            })
+        };
+        assert!(compute(0, 120.0).is_none());
+        assert!(compute(100, 120.0).is_none());
+        assert!(compute(20, 0.0).is_none());
+        assert!(compute(50, 60.0).is_some());
+    }
+
+    #[test]
+    fn test_run_ffmpeg_source_has_trim_duration() {
+        let src = include_str!("transcode_video.rs");
+        assert!(
+            src.contains("trim_duration"),
+            "run_ffmpeg must compute trim_duration"
+        );
+        assert!(
+            src.contains("\"-t\""),
+            "run_ffmpeg must pass -t flag to FFmpeg"
+        );
+    }
+
+    #[test]
+    fn test_video_format_struct_has_trim_percent_field() {
+        let src = include_str!("transcode_video.rs");
+        assert!(
+            src.contains("trim_percent: Option<u8>"),
+            "VideoFormat must have trim_percent field"
+        );
     }
 }

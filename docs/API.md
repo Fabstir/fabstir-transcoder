@@ -383,6 +383,7 @@ The transcoder caches downloaded source files and transcoded outputs on disk. A 
 | `encrypt` | bool | No | Override the request-level `is_encrypted` flag for this format |
 | `dest` | string | No | Storage destination: `"s5"` (default) or `"ipfs"` |
 | `compression_level` | int | No | Audio compression level (for FLAC) |
+| `trim_percent` | int | No | Keep only the first N% of duration (1–99). Omit for full duration. Used for generating free preview clips. |
 
 ### Preset Format Examples
 
@@ -465,6 +466,28 @@ The transcoder caches downloaded source files and transcoded outputs on disk. A 
   "ar": "44k"
 }
 ```
+
+**Preview / Paywall Pattern**
+
+To generate both a full encrypted video (paid) and a trimmed unencrypted preview (free) in a single request, use two format entries with `encrypt` and `trim_percent`:
+
+```json
+[
+  {
+    "id": 1, "ext": "mp4", "vcodec": "av1_nvenc",
+    "vf": "scale=1920x1080", "b_v": "5M",
+    "dest": "s5", "encrypt": true, "gpu": true
+  },
+  {
+    "id": 2, "ext": "mp4", "vcodec": "av1_nvenc",
+    "vf": "scale=1280x720", "b_v": "2M",
+    "trim_percent": 20, "encrypt": false,
+    "dest": "s5", "gpu": true
+  }
+]
+```
+
+Format 1 produces the full-length encrypted output (paid content CID). Format 2 produces a 20% duration preview at lower resolution, uploaded unencrypted (free preview CID). Both CIDs are returned in the `metadata` array of the `GetTranscoded` response.
 
 ### Available Resolutions
 
