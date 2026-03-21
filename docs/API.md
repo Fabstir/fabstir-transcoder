@@ -130,7 +130,7 @@ Authorization: Bearer <JWT_TOKEN>
 |---|---|---|---|
 | `source_cid` | string | Yes | Content identifier of the source media file. Supports `s5://` and `ipfs://` protocol prefixes. The `s5://` prefix is stripped automatically. |
 | `media_formats` | string | Yes | URL-encoded JSON array of format objects (see [Media Format Configuration](#media-format-configuration)). If empty string, defaults to formats from `MEDIA_FORMATS_FILE`. |
-| `is_encrypted` | bool | Yes | Whether the source file is encrypted (XChaCha20Poly1305). |
+| `is_encrypted` | bool | Yes | Whether the source file is encrypted (XChaCha20Poly1305). **When `true`, the `PORTAL_ENCRYPT_URL` env var must be set** — the server uses it instead of `PORTAL_URL` for downloads. |
 | `is_gpu` | bool | Yes | Whether to use GPU acceleration (NVIDIA NVENC). Can be overridden per-format via the `gpu` field in the format object. |
 
 **Response** `200 OK`
@@ -505,7 +505,7 @@ Configure the transcoder via a `.env` file in the `transcode_server/` directory.
 
 | Variable | Description | Default |
 |---|---|---|
-| `PORTAL_ENCRYPT_URL` | S5 gateway URL for encrypted uploads | (none) |
+| `PORTAL_ENCRYPT_URL` | S5 gateway URL for encrypted file downloads/uploads. **Required if any request uses `is_encrypted=true`** — the server reads this instead of `PORTAL_URL` for encrypted files. | (none) |
 | `IPFS_GATEWAY` | IPFS gateway URL for `ipfs://` CIDs | (none) |
 | `FILE_SIZE_THRESHOLD` | Source cache cleanup threshold (bytes) | `1000000000` (1 GB) |
 | `TRANSCODED_FILE_SIZE_THRESHOLD` | Transcoded cache cleanup threshold (bytes) | `1000000000` (1 GB) |
@@ -586,3 +586,11 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 ### Transcoding Errors
 
 When a format fails to transcode, it is skipped and does not appear in the `metadata` array. Other formats continue processing. The `progress` field still reaches 100 when all formats have been attempted.
+
+### Common Gotchas
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Required environment variable for PORTAL_URL not found` but `PORTAL_URL` is set | `is_encrypted=true` in the request causes the server to read `PORTAL_ENCRYPT_URL` instead. The error message is misleading — it always says "PORTAL_URL" regardless of which variable is missing. | Set `PORTAL_ENCRYPT_URL` or use `is_encrypted=false`. |
+| `Invalid source CID: <cid>` | CID is missing the protocol prefix. The server requires `s5://` or `ipfs://` before the CID. | Send `s5://uCtwQM...` not `uCtwQM...`. |
+| Panic at `server.rs` `garbage_collect` / `No such file or directory` | The directories specified by `PATH_TO_FILE` and `PATH_TO_TRANSCODED_FILE` don't exist. The server does not create them on startup. | Ensure directories exist before starting (e.g., `mkdir -p` in entrypoint). |

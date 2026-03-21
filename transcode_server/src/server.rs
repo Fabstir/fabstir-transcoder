@@ -219,17 +219,20 @@ async fn transcode_task_receiver(
 
         let source_cid = source_cid.unwrap();
 
-        let portal_url_result = if is_encrypted {
-            var("PORTAL_ENCRYPT_URL")
+        let portal_url_var = if is_encrypted {
+            "PORTAL_ENCRYPT_URL"
         } else {
-            var("PORTAL_URL")
+            "PORTAL_URL"
         };
 
-        let portal_url = match portal_url_result {
+        let portal_url = match var(portal_url_var) {
             Ok(url) => url,
             Err(_) => {
-                eprintln!("Required environment variable for PORTAL_URL not found");
-                continue; // Skip the rest of this loop iteration
+                eprintln!(
+                    "Required environment variable {} not found (is_encrypted={})",
+                    portal_url_var, is_encrypted
+                );
+                continue;
             }
         };
 
