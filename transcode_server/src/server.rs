@@ -192,278 +192,300 @@ fn generate_random_filename() -> String {
 ///   channel for transcoding tasks. Each task includes the input file path, output file path, desired format,
 ///   encryption flag, and GPU usage flag.
 ///
-async fn transcode_task_receiver(
-    receiver: Arc<Mutex<mpsc::Receiver<(String, String, String, bool, bool)>>>,
+async fn process_single_job(
+    task_id: String,
+    orig_source_cid: String,
+    media_formats: String,
+    is_encrypted: bool,
+    is_gpu: bool,
 ) {
-    while let Some((task_id, orig_source_cid, media_formats, is_encrypted, is_gpu)) =
-        receiver.lock().await.recv().await
-    {
-        let source_cid = Path::new(&orig_source_cid)
-            .with_extension("")
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string());
+    let source_cid = Path::new(&orig_source_cid)
+        .with_extension("")
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
 
-        if source_cid.is_none() {
-            eprintln!("Invalid source CID: {}", orig_source_cid);
-            continue;
+    if source_cid.is_none() {
+        eprintln!("Invalid source CID: {}", orig_source_cid);
+        return;
+    }
+
+    let storage_network: Option<&str> = orig_source_cid
+        .split_once("://")
+        .map(|(network, _)| network);
+    if storage_network.is_none() {
+        eprintln!("Invalid source CID: {}", orig_source_cid);
+        return;
+    }
+
+    let source_cid = source_cid.unwrap();
+
+    let portal_url_var = if is_encrypted {
+        "PORTAL_ENCRYPT_URL"
+    } else {
+        "PORTAL_URL"
+    };
+
+    let portal_url = match var(portal_url_var) {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!(
+                "Required environment variable {} not found (is_encrypted={})",
+                portal_url_var, is_encrypted
+            );
+            return;
         }
+    };
 
-        let storage_network: Option<&str> = orig_source_cid
-            .split_once("://")
-            .map(|(network, _)| network);
-        if storage_network.is_none() {
-            eprintln!("Invalid source CID: {}", orig_source_cid);
-            continue;
-        }
+    println!("source_cid: {}", source_cid);
+    println!("portal_url: {}", portal_url);
 
-        let source_cid = source_cid.unwrap();
+    let file_path = format!("{}{}", *PATH_TO_FILE, source_cid);
 
-        let portal_url_var = if is_encrypted {
-            "PORTAL_ENCRYPT_URL"
+    if !Path::new(&file_path).exists() {
+        if is_encrypted {
+            println!("source_cid: {}", source_cid);
+            let base64_url_encrypted_blob_hash = get_base64_url_encrypted_blob_hash(&source_cid)
+                .expect("Failed to get base64 URL encrypted blob hash");
+
+            let url = format!(
+                "{}{}{}?types=5,3",
+                portal_url, "/api/locations/", base64_url_encrypted_blob_hash
+            );
+            println!("Downloading and then transcoding video from URL: {}", &url);
+
+            let encrypted_file_path = format!("{}{}_", *PATH_TO_FILE, source_cid);
+
+            match download_video(&url, encrypted_file_path.as_str()).await {
+                Ok(_) => println!("Video downloaded successfully"),
+                Err(e) => {
+                    eprintln!(
+                        "Failed to download encrypted video from URL {}: {}",
+                        &url, e
+                    );
+                    return;
+                }
+            };
+
+            let encrypted_metadata = match std::fs::read_to_string(&encrypted_file_path) {
+                Ok(contents) => contents,
+                Err(e) => {
+                    eprintln!(
+                        "Failed to read encrypted metadata from file {}: {}",
+                        &encrypted_file_path, e
+                    );
+                    return;
+                }
+            };
+
+            let file_path_encrypted = format!("{}{}", *PATH_TO_FILE, generate_random_filename());
+
+            println!("file_encrypted_metadata: {:?}", file_path_encrypted);
+            println!("encrypted_metadata: {:?}", encrypted_metadata);
+
+            match download_and_concat_files(encrypted_metadata, file_path_encrypted.clone()).await {
+                Ok(()) => println!("Download and concatenation succeeded"),
+                Err(e) => eprintln!("Download and concatenation failed: {}", e),
+            }
+
+            let file_encrypted_size = get_file_size(file_path_encrypted.clone()).unwrap();
+            println!("file_path_encrypted: {}", file_path_encrypted);
+            println!("file_encrypted_size: {}", file_encrypted_size);
+
+            let last_index_size =
+                (file_encrypted_size as f64 / (262144 + 16) as f64).floor() as u32;
+
+            let key = get_key_from_encrypted_cid(&source_cid);
+            let key_bytes = base64url_to_bytes(&key);
+
+            println!("file_path: {}", file_path);
+            println!("key: {}", key);
+            println!("key_bytes: {:?}", key_bytes);
+            println!("last_index_size: {}", last_index_size);
+
+            match decrypt_file_xchacha20(
+                file_path_encrypted,
+                file_path.clone(),
+                key_bytes,
+                0,
+                last_index_size,
+            ) {
+                Ok(_) => println!("Decryption succeeded"),
+                Err(error) => {
+                    eprintln!("Decryption error: {:?}", error);
+                    return;
+                }
+            }
         } else {
-            "PORTAL_URL"
-        };
+            match storage_network.as_deref() {
+                Some("ipfs") => {
+                    let url = format!("{}{}{}", *IPFS_GATEWAY, "/ipfs/", source_cid);
 
-        let portal_url = match var(portal_url_var) {
-            Ok(url) => url,
-            Err(_) => {
-                eprintln!(
-                    "Required environment variable {} not found (is_encrypted={})",
-                    portal_url_var, is_encrypted
-                );
+                    match download_video(&url, file_path.as_str()).await {
+                        Ok(_) => println!("Video downloaded successfully from URL: {}", url),
+                        Err(e) => {
+                            eprintln!("Failed to download video from URL {}: {}", &url, e);
+                            return;
+                        }
+                    };
+                }
+                _ => {
+                    let url = format!("{}{}{}", portal_url, "/s5/blob/", source_cid);
+
+                    match download_video(&url, file_path.as_str()).await {
+                        Ok(_) => println!("Video downloaded successfully from URL: {}", url),
+                        Err(e) => {
+                            eprintln!("Failed to download video from URL {}: {}", &url, e);
+                            return;
+                        }
+                    };
+                }
+            }
+        }
+    } else {
+        println!("File already exists: {}", &file_path);
+    }
+
+    let media_formats_file = var("MEDIA_FORMATS_FILE").unwrap();
+
+    let media_formats_json = if !media_formats.is_empty() {
+        media_formats.clone()
+    } else {
+        read_to_string(media_formats_file.as_str()).expect("Failed to read video format file")
+    };
+
+    println!("media_formats_json: {}", media_formats_json);
+    let media_formats_vec: Vec<Value> =
+        serde_json::from_str(&media_formats_json).expect("Failed to parse video formats");
+
+    // Initialize progress to 0 at the start for all formats
+    let formats_count = media_formats_vec.len();
+    for i in 0..formats_count {
+        shared::update_progress(&task_id, i, 0);
+    }
+
+    // Then, we transcode the downloaded video with each video format
+    let mut transcoded_formats = Vec::new();
+    let mut source_duration: f64 = 0.0;
+
+    for (index, video_format) in media_formats_vec.iter().enumerate() {
+        let video_format_str = match serde_json::to_string(&video_format) {
+            Ok(str) => str,
+            Err(e) => {
+                eprintln!("Error serializing video format: {:?}", e);
                 continue;
             }
         };
 
-        println!("source_cid: {}", source_cid);
-        println!("portal_url: {}", portal_url);
-
-        let file_path = format!("{}{}", *PATH_TO_FILE, source_cid);
-
-        if !Path::new(&file_path).exists() {
-            if is_encrypted {
-                println!("source_cid: {}", source_cid);
-                let base64_url_encrypted_blob_hash =
-                    get_base64_url_encrypted_blob_hash(&source_cid)
-                        .expect("Failed to get base64 URL encrypted blob hash");
-
-                let url = format!(
-                    "{}{}{}?types=5,3",
-                    portal_url, "/api/locations/", base64_url_encrypted_blob_hash
-                );
-                println!("Downloading and then transcoding video from URL: {}", &url);
-
-                let encrypted_file_path = format!("{}{}_", *PATH_TO_FILE, source_cid);
-
-                match download_video(&url, encrypted_file_path.as_str()).await {
-                    Ok(_) => println!("Video downloaded successfully"),
-                    Err(e) => {
-                        eprintln!(
-                            "Failed to download encrypted video from URL {}: {}",
-                            &url, e
-                        );
-                        continue;
-                    }
-                };
-
-                let encrypted_metadata = match std::fs::read_to_string(&encrypted_file_path) {
-                    Ok(contents) => contents,
-                    Err(e) => {
-                        eprintln!(
-                            "Failed to read encrypted metadata from file {}: {}",
-                            &encrypted_file_path, e
-                        );
-                        continue;
-                    }
-                };
-
-                let file_path_encrypted =
-                    format!("{}{}", *PATH_TO_FILE, generate_random_filename());
-
-                println!("file_encrypted_metadata: {:?}", file_path_encrypted);
-                println!("encrypted_metadata: {:?}", encrypted_metadata);
-
-                match download_and_concat_files(encrypted_metadata, file_path_encrypted.clone())
-                    .await
-                {
-                    Ok(()) => println!("Download and concatenation succeeded"),
-                    Err(e) => eprintln!("Download and concatenation failed: {}", e),
-                }
-
-                let file_encrypted_size = get_file_size(file_path_encrypted.clone()).unwrap();
-                println!("file_path_encrypted: {}", file_path_encrypted);
-                println!("file_encrypted_size: {}", file_encrypted_size);
-
-                let last_index_size =
-                    (file_encrypted_size as f64 / (262144 + 16) as f64).floor() as u32;
-
-                let key = get_key_from_encrypted_cid(&source_cid);
-                let key_bytes = base64url_to_bytes(&key);
-
-                println!("file_path: {}", file_path);
-                println!("key: {}", key);
-                println!("key_bytes: {:?}", key_bytes);
-                println!("last_index_size: {}", last_index_size);
-
-                match decrypt_file_xchacha20(
-                    file_path_encrypted,
-                    file_path.clone(),
-                    key_bytes,
-                    0,
-                    last_index_size,
-                ) {
-                    Ok(_) => println!("Decryption succeeded"),
-                    Err(error) => {
-                        eprintln!("Decryption error: {:?}", error);
-                        continue;
-                    }
-                }
-            } else {
-                match storage_network.as_deref() {
-                    Some("ipfs") => {
-                        let url = format!("{}{}{}", *IPFS_GATEWAY, "/ipfs/", source_cid);
-
-                        match download_video(&url, file_path.as_str()).await {
-                            Ok(_) => println!("Video downloaded successfully from URL: {}", url),
-                            Err(e) => {
-                                eprintln!("Failed to download video from URL {}: {}", &url, e);
-                                continue;
-                            }
-                        };
-                    }
-                    _ => {
-                        let url = format!("{}{}{}", portal_url, "/s5/blob/", source_cid);
-
-                        match download_video(&url, file_path.as_str()).await {
-                            Ok(_) => println!("Video downloaded successfully from URL: {}", url),
-                            Err(e) => {
-                                eprintln!("Failed to download video from URL {}: {}", &url, e);
-                                continue;
-                            }
-                        };
-                    }
-                }
+        let format_result = get_video_format_from_str(&video_format_str);
+        let format = match format_result {
+            Ok(format) => format,
+            Err(e) => {
+                eprintln!("Failed to get video format from string: {}", e);
+                continue; // Skip the rest of this loop iteration
             }
-        } else {
-            println!("File already exists: {}", &file_path);
-        }
-
-        let media_formats_file = var("MEDIA_FORMATS_FILE").unwrap();
-
-        let media_formats_json = if !media_formats.is_empty() {
-            media_formats.clone()
-        } else {
-            read_to_string(media_formats_file.as_str()).expect("Failed to read video format file")
         };
 
-        println!("media_formats_json: {}", media_formats_json);
-        let media_formats_vec: Vec<Value> =
-            serde_json::from_str(&media_formats_json).expect("Failed to parse video formats");
-
-        // Initialize progress to 0 at the start for all formats
-        let formats_count = media_formats_vec.len();
-        for i in 0..formats_count {
-            shared::update_progress(&task_id, i, 0);
-        }
-
-        // Then, we transcode the downloaded video with each video format
-        let mut transcoded_formats = Vec::new();
-        let mut source_duration: f64 = 0.0;
-
-        for (index, video_format) in media_formats_vec.iter().enumerate() {
-            let video_format_str = match serde_json::to_string(&video_format) {
-                Ok(str) => str,
-                Err(e) => {
-                    eprintln!("Error serializing video format: {:?}", e);
-                    continue;
-                }
-            };
-
-            let format_result = get_video_format_from_str(&video_format_str);
-            let format = match format_result {
-                Ok(format) => format,
-                Err(e) => {
-                    eprintln!("Failed to get video format from string: {}", e);
-                    continue; // Skip the rest of this loop iteration
-                }
-            };
-
-            if !check_transcoded_file_exists(
-                file_path.as_str(),
-                &format.id.to_string(),
-                format.ext.as_str(),
+        if !check_transcoded_file_exists(
+            file_path.as_str(),
+            &format.id.to_string(),
+            format.ext.as_str(),
+        )
+        .await
+        {
+            let transcode_result: std::prelude::v1::Result<
+                Response<TranscodeVideoResponse>,
+                Status,
+            > = transcode_video(
+                task_id.clone(),
+                index,
+                &file_path,
+                &video_format_str,
+                is_encrypted,
+                is_gpu,
             )
-            .await
-            {
-                let transcode_result: std::prelude::v1::Result<
-                    Response<TranscodeVideoResponse>,
-                    Status,
-                > = transcode_video(
-                    task_id.clone(),
-                    index,
-                    &file_path,
-                    &video_format_str,
-                    is_encrypted,
-                    is_gpu,
-                )
-                .await;
+            .await;
 
-                match transcode_result {
-                    Ok(transcode_video_response) => {
-                        // Handle the successful response
-                        let response = transcode_video_response.into_inner();
-                        if source_duration == 0.0 && response.duration > 0.0 {
-                            source_duration = response.duration;
-                        }
-                        println!(
-                            "Response: status_code: {}, message: {}, cid: {}",
-                            response.status_code, response.message, response.cid
-                        );
-
-                        if response.status_code != 200 {
-                            eprintln!(
-                                "Format {} failed with status {}: {}",
-                                index, response.status_code, response.message
-                            );
-                            continue;
-                        }
-
-                        // Create a mutable clone of video_format
-                        let mut video_format_modified = video_format.clone();
-
-                        match &format.dest {
-                            Some(dest) if dest == "ipfs" => {
-                                video_format_modified["cid"] =
-                                    json!(format!("ipfs://{}", response.cid));
-                            }
-                            _ => {
-                                video_format_modified["cid"] =
-                                    json!(format!("s5://{}", response.cid));
-                            }
-                        }
-                        transcoded_formats.push(video_format_modified);
+            match transcode_result {
+                Ok(transcode_video_response) => {
+                    // Handle the successful response
+                    let response = transcode_video_response.into_inner();
+                    if source_duration == 0.0 && response.duration > 0.0 {
+                        source_duration = response.duration;
                     }
-                    Err(e) => {
-                        // Log the error and continue with the next format
-                        eprintln!("Error transcoding video: {:?}", e);
+                    println!(
+                        "Response: status_code: {}, message: {}, cid: {}",
+                        response.status_code, response.message, response.cid
+                    );
+
+                    if response.status_code != 200 {
+                        eprintln!(
+                            "Format {} failed with status {}: {}",
+                            index, response.status_code, response.message
+                        );
                         continue;
                     }
+
+                    // Create a mutable clone of video_format
+                    let mut video_format_modified = video_format.clone();
+
+                    match &format.dest {
+                        Some(dest) if dest == "ipfs" => {
+                            video_format_modified["cid"] =
+                                json!(format!("ipfs://{}", response.cid));
+                        }
+                        _ => {
+                            video_format_modified["cid"] = json!(format!("s5://{}", response.cid));
+                        }
+                    }
+                    transcoded_formats.push(video_format_modified);
+                }
+                Err(e) => {
+                    // Log the error and continue with the next format
+                    eprintln!("Error transcoding video: {:?}", e);
+                    continue;
                 }
             }
         }
+    }
 
-        let transcoded_json = serde_json::to_string(&transcoded_formats).unwrap_or_else(|e| {
-            eprintln!("Error serializing transcoded formats: {:?}", e);
-            "".to_string()
-        });
+    let transcoded_json = serde_json::to_string(&transcoded_formats).unwrap_or_else(|e| {
+        eprintln!("Error serializing transcoded formats: {:?}", e);
+        "".to_string()
+    });
 
-        let mut transcoded = TRANSCODED.lock().await;
-        transcoded.insert(task_id.clone(), (transcoded_json, source_duration));
+    let mut transcoded = TRANSCODED.lock().await;
+    transcoded.insert(task_id.clone(), (transcoded_json, source_duration));
 
-        // Mark progress as complete (100%) for all formats
-        for i in 0..formats_count {
-            shared::update_progress(&task_id, i, 100);
+    // Mark progress as complete (100%) for all formats
+    for i in 0..formats_count {
+        shared::update_progress(&task_id, i, 100);
+    }
+}
+
+async fn transcode_task_receiver(
+    receiver: Arc<Mutex<mpsc::Receiver<(String, String, String, bool, bool)>>>,
+) {
+    loop {
+        let task = receiver.lock().await.recv().await;
+        match task {
+            Some((task_id, orig_source_cid, media_formats, is_encrypted, is_gpu)) => {
+                let permit = shared::SEMAPHORE.acquire().await.unwrap();
+                shared::decrement_queued_increment_active();
+                tokio::spawn(async move {
+                    process_single_job(
+                        task_id,
+                        orig_source_cid,
+                        media_formats,
+                        is_encrypted,
+                        is_gpu,
+                    )
+                    .await;
+                    shared::decrement_active();
+                    drop(permit);
+                });
+            }
+            None => break,
         }
     }
 }
@@ -520,6 +542,7 @@ impl TranscodeService for TranscodeServiceHandler {
                     e
                 )));
             }
+            shared::increment_queued();
         }
 
         let response = TranscodeResponse {
@@ -621,6 +644,7 @@ impl RestHandler {
             {
                 return Err(warp::reject::custom(TranscodeError::from(e)));
             }
+            shared::increment_queued();
         }
 
         let response = transcode::TranscodeResponse {
@@ -650,6 +674,13 @@ impl From<transcode::GetTranscodedResponse> for GetTranscodedResponseWrapper {
             duration: response.duration,
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct StatusResponse {
+    active_jobs: usize,
+    queued_jobs: usize,
+    max_concurrent: usize,
 }
 
 impl RestHandler {
@@ -786,7 +817,20 @@ async fn main() {
         .and(warp::get())
         .map(|| warp::reply::json(&serde_json::json!({"status": "ok"})));
 
-    let routes = health.or(transcode).or(get_transcoded);
+    let status = warp::path!("status")
+        .and(warp::get())
+        .and(auth::with_auth())
+        .map(|| {
+            warp::reply::json(&StatusResponse {
+                active_jobs: shared::active_jobs(),
+                queued_jobs: shared::queued_jobs(),
+                max_concurrent: shared::max_concurrent(),
+            })
+        })
+        .with(cors.clone())
+        .boxed();
+
+    let routes = health.or(status).or(transcode).or(get_transcoded);
     let rest_server = warp::serve(routes).run(([0, 0, 0, 0], 8000));
 
     let garbage_collection_secs = GARBAGE_COLLECTOR_INTERVAL
@@ -921,5 +965,51 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn test_status_endpoint_exists() {
+        let server_src = include_str!("server.rs");
+        assert!(
+            server_src.contains(r#"warp::path!("status")"#),
+            "REST server must have a /status endpoint"
+        );
+    }
+
+    #[test]
+    fn test_status_response_has_required_fields() {
+        let resp = StatusResponse {
+            active_jobs: 1,
+            queued_jobs: 2,
+            max_concurrent: 3,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"active_jobs\""));
+        assert!(json.contains("\"queued_jobs\""));
+        assert!(json.contains("\"max_concurrent\""));
+    }
+
+    #[test]
+    fn test_concurrent_receiver_uses_semaphore() {
+        let server_src = include_str!("server.rs");
+        assert!(
+            server_src.contains("shared::SEMAPHORE.acquire()"),
+            "receiver must acquire semaphore permit"
+        );
+        assert!(
+            server_src.contains("tokio::spawn"),
+            "receiver must spawn jobs concurrently"
+        );
+    }
+
+    #[test]
+    fn test_send_sites_increment_queued() {
+        let server_src = include_str!("server.rs");
+        let count = server_src.matches("shared::increment_queued()").count();
+        assert!(
+            count >= 2,
+            "Both gRPC and REST send sites must call shared::increment_queued() (found {})",
+            count
+        );
     }
 }

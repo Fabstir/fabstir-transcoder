@@ -10,12 +10,14 @@ The Fabstir Transcoder exposes a REST API on port **8000** and a gRPC API on por
 - [Authentication](#authentication)
 - [REST API](#rest-api)
   - [GET /health](#get-health)
+  - [GET /status](#get-status)
   - [POST /transcode](#post-transcode)
   - [GET /get_transcoded/{task_id}](#get-get_transcodedtask_id)
 - [gRPC API](#grpc-api)
   - [Transcode](#rpc-transcode)
   - [GetTranscoded](#rpc-gettranscoded)
 - [Transcoding Workflow](#transcoding-workflow)
+  - [Concurrent Processing](#concurrent-processing)
 - [Media Format Configuration](#media-format-configuration)
 - [Environment Variables](#environment-variables)
 - [Deployment](#deployment)
@@ -109,6 +111,44 @@ GET /health
 {
   "status": "ok"
 }
+```
+
+---
+
+### GET /status
+
+Authenticated endpoint reporting the server's current workload. Use this for
+multi-host load balancing — route new jobs to the host with the lowest
+`active_jobs` or highest available capacity (`max_concurrent - active_jobs`).
+
+**Request**
+
+```
+GET /status
+Authorization: Bearer <JWT_TOKEN>
+```
+
+**Response** `200 OK`
+
+```json
+{
+  "active_jobs": 2,
+  "queued_jobs": 1,
+  "max_concurrent": 3
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `active_jobs` | int | Number of transcode jobs currently running |
+| `queued_jobs` | int | Number of jobs waiting for a processing slot |
+| `max_concurrent` | int | Maximum simultaneous jobs (from `MAX_CONCURRENT_TRANSCODES` env var) |
+
+**Example**
+
+```bash
+curl http://localhost:8000/status \
+  -H "Authorization: Bearer <JWT_TOKEN>"
 ```
 
 ---
@@ -305,11 +345,14 @@ Client                          Transcoder
   |  source_cid, media_formats,     |
   |  is_encrypted, is_gpu           |
   |-------------------------------->|
-  |                                 |  Queue job via mpsc channel
+  |                                 |  Queue job (increment QUEUED counter)
   |  { task_id: "abc-123" }         |
   |<--------------------------------|
   |                                 |
-  |                                 |  [Background processing]
+  |                                 |  [Acquire semaphore permit]
+  |                                 |  (waits if MAX_CONCURRENT reached)
+  |                                 |
+  |                                 |  [Background processing — concurrent]
   |                                 |  1. Download source from S5/IPFS
   |                                 |  2. Decrypt if is_encrypted=true
   |                                 |  3. Extract duration via ffprobe
@@ -320,6 +363,7 @@ Client                          Transcoder
   |                                 |     d. Upload to S5/IPFS
   |                                 |     e. Record output CID
   |                                 |  5. Store metadata + duration
+  |                                 |  6. Release semaphore permit
   |                                 |
   |  GET /get_transcoded/abc-123    |
   |-------------------------------->|
@@ -346,6 +390,15 @@ When `is_encrypted` is `true` (or overridden per-format via the `encrypt` field)
 When `is_gpu` is `true` (or overridden per-format via the `gpu` field):
 - FFmpeg uses NVIDIA NVENC hardware encoders (`av1_nvenc`, `h264_nvenc`, etc.)
 - Requires NVIDIA GPU with CUDA support and nvidia-container-toolkit in Docker
+- **NVENC session limit**: Consumer GPUs support 3–5 concurrent NVENC sessions; professional cards (e.g., A100, L40) have no limit. Set `MAX_CONCURRENT_TRANSCODES` to stay within your GPU's session limit.
+
+### Concurrent Processing
+
+The transcoder processes multiple jobs concurrently, bounded by `MAX_CONCURRENT_TRANSCODES` (default: 3). When all slots are occupied, new jobs wait in the queue until a slot opens.
+
+- **Monitoring**: Use `GET /status` to check `active_jobs`, `queued_jobs`, and `max_concurrent`
+- **Load balancing**: For multi-host deployments, poll `/status` on each host and route new jobs to the host with the most available capacity (`max_concurrent - active_jobs`)
+- **GPU limit**: Set `MAX_CONCURRENT_TRANSCODES` at or below your GPU's NVENC session limit (3–5 for consumer cards, unlimited for professional cards)
 
 ### Cache and Garbage Collection
 
@@ -533,6 +586,7 @@ Configure the transcoder via a `.env` file in the `transcode_server/` directory.
 | `FILE_SIZE_THRESHOLD` | Source cache cleanup threshold (bytes) | `1000000000` (1 GB) |
 | `TRANSCODED_FILE_SIZE_THRESHOLD` | Transcoded cache cleanup threshold (bytes) | `1000000000` (1 GB) |
 | `GARBAGE_COLLECTOR_INTERVAL` | Cache cleanup interval (seconds) | `3600` (1 hour) |
+| `MAX_CONCURRENT_TRANSCODES` | Maximum number of transcode jobs processed simultaneously | `3` |
 | `NVIDIA_DRIVER_CAPABILITIES` | NVIDIA container capabilities | `compute,utility,video` |
 | `PINATA_API_KEY` | Pinata IPFS API key (if using Pinata) | (none) |
 | `PINATA_API_SECRET` | Pinata IPFS API secret | (none) |
