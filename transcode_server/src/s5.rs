@@ -74,8 +74,7 @@ pub async fn upload_video_s5(path: &str) -> Result<String, anyhow::Error> {
     ) {
         Ok(url) => url,
         Err(e) => {
-            eprintln!("Failed to create file on server: {}", e);
-            String::new()
+            return Err(anyhow!("Failed to create file on server: {}", e));
         }
     };
 
@@ -83,7 +82,9 @@ pub async fn upload_video_s5(path: &str) -> Result<String, anyhow::Error> {
     let chunk_size: usize = 1024 * 1024 * 5;
     match client.upload_with_chunk_size(&upload_url, path, chunk_size) {
         Ok(_) => (),
-        Err(e) => eprintln!("Failed to upload file to server: {}", e),
+        Err(e) => {
+            return Err(anyhow!("Failed to upload file to server: {}", e));
+        }
     }
 
     println!("upload_video_s5: cid: {:?}", cid_bytes);

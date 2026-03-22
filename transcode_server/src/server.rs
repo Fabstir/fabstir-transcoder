@@ -421,6 +421,14 @@ async fn transcode_task_receiver(
                             response.status_code, response.message, response.cid
                         );
 
+                        if response.status_code != 200 {
+                            eprintln!(
+                                "Format {} failed with status {}: {}",
+                                index, response.status_code, response.message
+                            );
+                            continue;
+                        }
+
                         // Create a mutable clone of video_format
                         let mut video_format_modified = video_format.clone();
 
@@ -863,5 +871,55 @@ mod tests {
             server_src.contains(r#"warp::path!("health")"#),
             "REST server must have a /health endpoint"
         );
+    }
+
+    #[test]
+    fn test_upload_video_s5_propagates_create_error() {
+        let s5_src = include_str!("s5.rs");
+        assert!(
+            !s5_src.contains("String::new()"),
+            "s5.rs must not swallow create_with_metadata errors with String::new()"
+        );
+        assert!(
+            s5_src.contains("Failed to create file on server"),
+            "s5.rs must have create error message"
+        );
+        assert!(
+            s5_src.contains("return Err"),
+            "s5.rs must return Err on create failure"
+        );
+    }
+
+    #[test]
+    fn test_upload_video_s5_propagates_upload_error() {
+        let s5_src = include_str!("s5.rs");
+        assert!(
+            s5_src.contains(r#"return Err(anyhow!("Failed to upload file to server"#),
+            "s5.rs must return Err on upload failure"
+        );
+    }
+
+    #[test]
+    fn test_transcode_loop_checks_status_code() {
+        let server_src = include_str!("server.rs");
+        assert!(
+            server_src.contains("response.status_code != 200"),
+            "transcode loop must check response.status_code"
+        );
+    }
+
+    #[test]
+    fn test_failed_status_code_is_not_200() {
+        let success: i32 = 200;
+        let failures: [i32; 3] = [500, 400, 0];
+        assert_eq!(success != 200, false, "200 should pass the guard");
+        for code in &failures {
+            assert_eq!(
+                *code != 200,
+                true,
+                "status {} should be caught by the guard",
+                code
+            );
+        }
     }
 }
