@@ -160,7 +160,7 @@ Queue a new transcoding job. Returns immediately with a `task_id` for polling.
 **Request**
 
 ```
-POST /transcode?source_cid=<cid>&media_formats=<json>&is_encrypted=<bool>&is_gpu=<bool>
+POST /transcode?source_cid=<cid>&media_formats=<json>&is_encrypted=<bool>&is_gpu=<bool>[&preview_percent=<int>]
 Authorization: Bearer <JWT_TOKEN>
 ```
 
@@ -172,6 +172,7 @@ Authorization: Bearer <JWT_TOKEN>
 | `media_formats` | string | Yes | URL-encoded JSON array of format objects (see [Media Format Configuration](#media-format-configuration)). If empty string, defaults to formats from `MEDIA_FORMATS_FILE`. |
 | `is_encrypted` | bool | Yes | Whether the source file is encrypted (XChaCha20Poly1305). **When `true`, the `PORTAL_ENCRYPT_URL` env var must be set** — the server uses it instead of `PORTAL_URL` for downloads. |
 | `is_gpu` | bool | Yes | Whether to use GPU acceleration (NVIDIA NVENC). Can be overridden per-format via the `gpu` field in the format object. |
+| `preview_percent` | int | No | First N% of HLS segments are unencrypted (0-100). Only applies to HLS formats. Default: 0 (all segments encrypted). This is a **request-level** parameter, not a per-format field. |
 
 **Response** `200 OK`
 
@@ -306,6 +307,7 @@ message TranscodeRequest {
     string media_formats = 2;
     bool is_encrypted = 3;
     bool is_gpu = 4;
+    uint32 preview_percent = 5;
 }
 
 message TranscodeResponse {
@@ -437,6 +439,8 @@ The transcoder caches downloaded source files and transcoded outputs on disk. A 
 | `dest` | string | No | Storage destination: `"s5"` (default) or `"ipfs"` |
 | `compression_level` | int | No | Audio compression level (for FLAC) |
 | `trim_percent` | int | No | Keep only the first N% of duration (1–99). Omit for full duration. Used for generating free preview clips. |
+| `hls` | bool | No | When `true`, output fMP4 segments instead of a single file. Response includes `segments[]` array with per-segment CIDs. |
+| `hls_time` | int | No | HLS segment duration in seconds. Default: 6. Only used when `hls: true`. |
 
 ### Preset Format Examples
 
@@ -541,6 +545,60 @@ To generate both a full encrypted video (paid) and a trimmed unencrypted preview
 ```
 
 Format 1 produces the full-length encrypted output (paid content CID). Format 2 produces a 20% duration preview at lower resolution, uploaded unencrypted (free preview CID). Both CIDs are returned in the `metadata` array of the `GetTranscoded` response.
+
+**HLS Adaptive Streaming**
+
+For adaptive bitrate streaming, use `hls: true` on each format. The `preview_percent` query parameter controls which segments are unencrypted (preview) vs encrypted (paid). The SDK builds `.m3u8` playlists from the returned segment CIDs.
+
+```json
+[
+  {
+    "id": 1, "ext": "mp4", "vcodec": "av1_nvenc",
+    "vf": "scale=1920x1080", "b_v": "5M",
+    "hls": true, "hls_time": 6, "gpu": true
+  },
+  {
+    "id": 2, "ext": "mp4", "vcodec": "av1_nvenc",
+    "vf": "scale=1280x720", "b_v": "2.5M",
+    "hls": true, "hls_time": 6, "gpu": true
+  },
+  {
+    "id": 3, "ext": "mp4", "vcodec": "av1_nvenc",
+    "vf": "scale=854x480", "b_v": "1.15M",
+    "hls": true, "hls_time": 6, "gpu": true
+  },
+  {
+    "id": 4, "ext": "mp4", "vcodec": "av1_nvenc",
+    "vf": "scale=640x360", "b_v": "0.6M",
+    "hls": true, "hls_time": 6, "gpu": true
+  }
+]
+```
+
+With `preview_percent=15`, the response for each HLS format includes:
+
+```json
+{
+  "id": 1, "ext": "mp4", "vcodec": "av1_nvenc",
+  "vf": "scale=1920x1080", "b_v": "5M",
+  "hls": true,
+  "initSegmentCid": "s5://zInitSeg...",
+  "segments": [
+    { "index": 0, "cid": "s5://zSeg0...", "duration": 6.006, "encrypted": false },
+    { "index": 1, "cid": "s5://zSeg1...", "duration": 6.006, "encrypted": false },
+    { "index": 15, "cid": "s5://uSeg15...", "duration": 6.006, "encrypted": true }
+  ],
+  "previewSegments": 15,
+  "totalSegments": 100,
+  "totalDuration": 598.764
+}
+```
+
+- Segments with `index < previewSegments` have `encrypted: false` and `s5://z` CID prefix (unencrypted)
+- Segments with `index >= previewSegments` have `encrypted: true` and `s5://u` CID prefix (encrypted, key embedded in CID)
+- `initSegmentCid` is always unencrypted
+- Non-HLS formats in the same request still return a single `cid` field
+- Progress reports 0-70% during FFmpeg encoding, 70-100% during segment upload
 
 ### Available Resolutions
 

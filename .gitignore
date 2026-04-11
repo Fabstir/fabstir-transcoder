@@ -49,3 +49,5 @@ protoc/include/
 
 docs/development/
 docs/temp/
+docs/node-reference/
+docs/fabstir-reference/

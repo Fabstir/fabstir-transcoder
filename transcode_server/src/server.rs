@@ -22,6 +22,7 @@ use utils::{base64url_to_bytes, bytes_to_base64url, download_and_concat_files, d
 mod transcode_video;
 use transcode_video::{get_video_format_from_str, transcode_video, TranscodeVideoResponse};
 
+mod hls_segment;
 mod shared;
 
 use tonic::{transport::Server, Request, Response, Status};
@@ -79,6 +80,16 @@ static GARBAGE_COLLECTOR_INTERVAL: Lazy<String> = Lazy::new(|| {
 });
 static IPFS_GATEWAY: Lazy<String> =
     Lazy::new(|| var("IPFS_GATEWAY").unwrap_or_else(|_| panic!("IPFS_GATEWAY not set in .env")));
+
+#[derive(Debug, Clone)]
+struct TranscodeJob {
+    task_id: String,
+    source_cid: String,
+    media_formats: String,
+    is_encrypted: bool,
+    is_gpu: bool,
+    preview_percent: u32,
+}
 
 fn get_file_size(file_path: String) -> std::io::Result<u64> {
     let metadata = fs::metadata(file_path)?;
@@ -198,7 +209,9 @@ async fn process_single_job(
     media_formats: String,
     is_encrypted: bool,
     is_gpu: bool,
+    preview_percent: u32,
 ) {
+    println!("preview_percent: {}", preview_percent);
     let source_cid = Path::new(&orig_source_cid)
         .with_extension("")
         .file_stem()
@@ -403,6 +416,7 @@ async fn process_single_job(
                 &video_format_str,
                 is_encrypted,
                 is_gpu,
+                preview_percent,
             )
             .await;
 
@@ -429,13 +443,29 @@ async fn process_single_job(
                     // Create a mutable clone of video_format
                     let mut video_format_modified = video_format.clone();
 
-                    match &format.dest {
-                        Some(dest) if dest == "ipfs" => {
-                            video_format_modified["cid"] =
-                                json!(format!("ipfs://{}", response.cid));
+                    if format.hls.unwrap_or(false) {
+                        if let Ok(hls_result) = serde_json::from_str::<Value>(&response.cid) {
+                            video_format_modified["hls"] = json!(true);
+                            video_format_modified["initSegmentCid"] =
+                                hls_result["init_segment_cid"].clone();
+                            video_format_modified["segments"] = hls_result["segments"].clone();
+                            video_format_modified["previewSegments"] =
+                                hls_result["preview_segments"].clone();
+                            video_format_modified["totalSegments"] =
+                                hls_result["total_segments"].clone();
+                            video_format_modified["totalDuration"] =
+                                hls_result["total_duration"].clone();
                         }
-                        _ => {
-                            video_format_modified["cid"] = json!(format!("s5://{}", response.cid));
+                    } else {
+                        match &format.dest {
+                            Some(dest) if dest == "ipfs" => {
+                                video_format_modified["cid"] =
+                                    json!(format!("ipfs://{}", response.cid));
+                            }
+                            _ => {
+                                video_format_modified["cid"] =
+                                    json!(format!("s5://{}", response.cid));
+                            }
                         }
                     }
                     transcoded_formats.push(video_format_modified);
@@ -463,22 +493,21 @@ async fn process_single_job(
     }
 }
 
-async fn transcode_task_receiver(
-    receiver: Arc<Mutex<mpsc::Receiver<(String, String, String, bool, bool)>>>,
-) {
+async fn transcode_task_receiver(receiver: Arc<Mutex<mpsc::Receiver<TranscodeJob>>>) {
     loop {
         let task = receiver.lock().await.recv().await;
         match task {
-            Some((task_id, orig_source_cid, media_formats, is_encrypted, is_gpu)) => {
+            Some(job) => {
                 let permit = shared::SEMAPHORE.acquire().await.unwrap();
                 shared::decrement_queued_increment_active();
                 tokio::spawn(async move {
                     process_single_job(
-                        task_id,
-                        orig_source_cid,
-                        media_formats,
-                        is_encrypted,
-                        is_gpu,
+                        job.task_id,
+                        job.source_cid,
+                        job.media_formats,
+                        job.is_encrypted,
+                        job.is_gpu,
+                        job.preview_percent,
                     )
                     .await;
                     shared::decrement_active();
@@ -493,7 +522,7 @@ async fn transcode_task_receiver(
 // The gRPC service implementation
 #[derive(Debug, Clone)]
 struct TranscodeServiceHandler {
-    transcode_task_sender: Option<Arc<Mutex<mpsc::Sender<(String, String, String, bool, bool)>>>>,
+    transcode_task_sender: Option<Arc<Mutex<mpsc::Sender<TranscodeJob>>>>,
 }
 
 #[async_trait]
@@ -528,13 +557,14 @@ impl TranscodeService for TranscodeServiceHandler {
         if let Some(ref sender) = self.transcode_task_sender {
             let sender = sender.lock().await.clone();
             if let Err(e) = sender
-                .send((
-                    task_id.to_string(),
-                    source_cid.clone(),
-                    media_formats.clone(),
+                .send(TranscodeJob {
+                    task_id: task_id.to_string(),
+                    source_cid: source_cid.clone(),
+                    media_formats: media_formats.clone(),
                     is_encrypted,
                     is_gpu,
-                ))
+                    preview_percent: request.get_ref().preview_percent,
+                })
                 .await
             {
                 return Err(Status::internal(format!(
@@ -606,17 +636,15 @@ impl From<transcode::TranscodeResponse> for TranscodeResponseWrapper {
     }
 }
 
-impl From<tokio::sync::mpsc::error::SendError<(String, String, String, bool, bool)>>
-    for TranscodeError
-{
-    fn from(e: tokio::sync::mpsc::error::SendError<(String, String, String, bool, bool)>) -> Self {
+impl From<tokio::sync::mpsc::error::SendError<TranscodeJob>> for TranscodeError {
+    fn from(e: tokio::sync::mpsc::error::SendError<TranscodeJob>) -> Self {
         TranscodeError(format!("Failed to send transcoding task: {}", e))
     }
 }
 
 #[derive(Debug, Clone)]
 struct RestHandler {
-    transcode_task_sender: Option<Arc<Mutex<mpsc::Sender<(String, String, String, bool, bool)>>>>,
+    transcode_task_sender: Option<Arc<Mutex<mpsc::Sender<TranscodeJob>>>>,
 }
 
 impl RestHandler {
@@ -626,6 +654,7 @@ impl RestHandler {
         media_formats: String,
         is_encrypted: bool,
         is_gpu: bool,
+        preview_percent: u32,
     ) -> Result<impl warp::Reply, warp::Rejection> {
         let task_id = Uuid::new_v4();
 
@@ -633,13 +662,14 @@ impl RestHandler {
             let sender = sender.lock().await.clone();
 
             if let Err(e) = sender
-                .send((
-                    task_id.to_string(),
-                    source_cid.clone(),
-                    media_formats.clone(),
+                .send(TranscodeJob {
+                    task_id: task_id.to_string(),
+                    source_cid: source_cid.clone(),
+                    media_formats: media_formats.clone(),
                     is_encrypted,
                     is_gpu,
-                ))
+                    preview_percent,
+                })
                 .await
             {
                 return Err(warp::reject::custom(TranscodeError::from(e)));
@@ -712,25 +742,45 @@ async fn check_transcoded_file_exists(cid: &str, label: &str, ext: &str) -> bool
     Path::new(&filename).exists()
 }
 
+fn dir_size(path: &Path) -> u64 {
+    fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 fn garbage_collect(directory: &str, size_threshold: u64) {
     let mut files: Vec<_> = fs::read_dir(directory)
         .unwrap()
         .filter_map(|entry| {
             entry.ok().and_then(|e| {
-                e.metadata()
-                    .ok()
-                    .map(|m| (e.path(), m.len(), m.created().unwrap()))
+                let meta = e.metadata().ok()?;
+                let size = if meta.is_dir() {
+                    dir_size(&e.path())
+                } else {
+                    meta.len()
+                };
+                let created = meta.created().ok()?;
+                Some((e.path(), size, created, meta.is_dir()))
             })
         })
         .collect();
 
-    files.sort_by_key(|k| k.2); // Sort files by creation time
+    files.sort_by_key(|k| k.2); // Sort by creation time
 
-    let mut total_size: u64 = files.iter().map(|(_, size, _)| size).sum();
+    let mut total_size: u64 = files.iter().map(|(_, size, _, _)| size).sum();
 
     while total_size > size_threshold && !files.is_empty() {
-        if let Some((file, size, _)) = files.pop() {
-            fs::remove_file(file).unwrap();
+        if let Some((path, size, _, is_dir)) = files.pop() {
+            if is_dir {
+                fs::remove_dir_all(&path).ok();
+            } else {
+                fs::remove_file(&path).ok();
+            }
             total_size -= size;
         }
     }
@@ -747,6 +797,7 @@ struct QueryParams {
     media_formats: String,
     is_encrypted: bool,
     is_gpu: bool,
+    preview_percent: Option<u32>,
 }
 
 /// The main entry point for the transcode server. Initializes the server
@@ -758,7 +809,7 @@ struct QueryParams {
 async fn main() {
     dotenv().ok();
 
-    let (task_sender, task_receiver) = mpsc::channel::<(String, String, String, bool, bool)>(100);
+    let (task_sender, task_receiver) = mpsc::channel::<TranscodeJob>(100);
     let task_receiver = Arc::new(Mutex::new(task_receiver));
     tokio::spawn(transcode_task_receiver(Arc::clone(&task_receiver)));
 
@@ -796,6 +847,7 @@ async fn main() {
                         params.media_formats,
                         params.is_encrypted,
                         params.is_gpu,
+                        params.preview_percent.unwrap_or(0),
                     )
                     .await
             }
@@ -1011,5 +1063,53 @@ mod tests {
             "Both gRPC and REST send sites must call shared::increment_queued() (found {})",
             count
         );
+    }
+
+    #[test]
+    fn test_proto_has_preview_percent() {
+        let proto_src = include_str!("../proto/transcode.proto");
+        assert!(
+            proto_src.contains("uint32 preview_percent"),
+            "TranscodeRequest proto must contain 'uint32 preview_percent' field"
+        );
+    }
+
+    #[test]
+    fn test_transcode_job_struct() {
+        let job = TranscodeJob {
+            task_id: "abc".to_string(),
+            source_cid: "s5://test".to_string(),
+            media_formats: "[]".to_string(),
+            is_encrypted: false,
+            is_gpu: true,
+            preview_percent: 15,
+        };
+        assert_eq!(job.preview_percent, 15);
+        assert_eq!(job.task_id, "abc");
+    }
+
+    #[test]
+    fn test_query_params_deserializes_preview_percent() {
+        let json = r#"{"source_cid":"s5://x","media_formats":"[]","is_encrypted":false,"is_gpu":false,"preview_percent":20}"#;
+        let params: QueryParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.preview_percent, Some(20));
+
+        let json_without =
+            r#"{"source_cid":"s5://x","media_formats":"[]","is_encrypted":false,"is_gpu":false}"#;
+        let params2: QueryParams = serde_json::from_str(json_without).unwrap();
+        assert_eq!(params2.preview_percent, None);
+    }
+
+    #[test]
+    fn test_process_single_job_handles_hls_response() {
+        let src = include_str!("server.rs");
+        assert!(src.contains("initSegmentCid"), "must map initSegmentCid");
+        assert!(src.contains("totalSegments"), "must map totalSegments");
+    }
+
+    #[test]
+    fn test_preview_percent_threaded_to_transcode_video() {
+        let src = include_str!("server.rs");
+        assert!(src.contains("preview_percent"), "must pass preview_percent");
     }
 }

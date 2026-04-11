@@ -7,6 +7,7 @@ message TranscodeRequest {
     string media_formats = 2;
     bool is_encrypted = 3;
     bool is_gpu = 4;
+    uint32 preview_percent = 5;
 }
 
 message TranscodeResponse {

@@ -66,6 +66,8 @@ pub struct TranscodeVideoResponse {
 /// * `dest` - Destination path for the transcoded file
 /// * `encrypt` - Whether to encrypt the output file
 /// * `trim_percent` - Keep only the first N% of duration (1–99); used for preview clips
+/// * `hls` - When true, output fMP4 segments instead of single file
+/// * `hls_time` - Segment duration in seconds (default 6)
 #[derive(Debug, Deserialize)]
 pub struct VideoFormat {
     pub id: u32,
@@ -88,6 +90,8 @@ pub struct VideoFormat {
     pub dest: Option<String>,
     encrypt: Option<bool>,
     trim_percent: Option<u8>,
+    pub hls: Option<bool>,
+    pub hls_time: Option<u32>,
 }
 
 fn add_arg(cmd: &mut Command, arg: &str, value: Option<&str>) {
@@ -169,6 +173,10 @@ fn parse_progress(line: &str, total_duration: f64) -> Option<i32> {
     None
 }
 
+pub fn hls_output_dir(file_name: &str) -> String {
+    format!("{}{}_hls", *PATH_TO_TRANSCODED_FILE, file_name)
+}
+
 /// Executes the ffmpeg command to transcode a video file based on the specified parameters.
 /// This function supports GPU acceleration and handles various video formats.
 ///
@@ -205,6 +213,11 @@ fn run_ffmpeg(
             None
         }
     });
+    let trim_duration = if format.hls.unwrap_or(false) {
+        None
+    } else {
+        trim_duration
+    };
     // Progress should track against trimmed duration, not full source
     let progress_duration = trim_duration.unwrap_or(total_duration);
 
@@ -250,14 +263,42 @@ fn run_ffmpeg(
         if let Some(td) = trim_duration {
             cmd.args(["-t", &format!("{:.3}", td)]);
         }
-        cmd.args([
-            "-y",
-            format!(
-                "{}{}_ue.{}",
-                *PATH_TO_TRANSCODED_FILE, file_name, format.ext
-            )
-            .as_str(),
-        ]);
+        if format.hls.unwrap_or(false) {
+            let hls_dir = hls_output_dir(file_name);
+            std::fs::create_dir_all(&hls_dir).map_err(|e| {
+                Status::new(Code::Internal, format!("Failed to create HLS dir: {}", e))
+            })?;
+            let hls_time = format.hls_time.unwrap_or(6).to_string();
+            cmd.args([
+                "-f",
+                "hls",
+                "-hls_time",
+                &hls_time,
+                "-hls_segment_type",
+                "fmp4",
+                "-hls_fflags",
+                "+split_by_time",
+                "-hls_list_size",
+                "0",
+                "-hls_playlist_type",
+                "vod",
+                "-hls_fmp4_init_filename",
+                "init.mp4",
+                "-hls_segment_filename",
+                &format!("{}/seg_%04d.m4s", hls_dir),
+                "-y",
+                &format!("{}/playlist.m3u8", hls_dir),
+            ]);
+        } else {
+            cmd.args([
+                "-y",
+                format!(
+                    "{}{}_ue.{}",
+                    *PATH_TO_TRANSCODED_FILE, file_name, format.ext
+                )
+                .as_str(),
+            ]);
+        }
 
         // Convert to Vec<String> instead of Vec<Cow<'_, str>>
         let args: Vec<String> = cmd
@@ -316,14 +357,42 @@ fn run_ffmpeg(
                 if let Some(td) = trim_duration {
                     cmd.args(["-t", &format!("{:.3}", td)]);
                 }
-                cmd.args([
-                    "-y",
-                    format!(
-                        "{}{}_ue.{}",
-                        *PATH_TO_TRANSCODED_FILE, file_name, format.ext
-                    )
-                    .as_str(),
-                ]);
+                if format.hls.unwrap_or(false) {
+                    let hls_dir = hls_output_dir(file_name);
+                    std::fs::create_dir_all(&hls_dir).map_err(|e| {
+                        Status::new(Code::Internal, format!("Failed to create HLS dir: {}", e))
+                    })?;
+                    let hls_time = format.hls_time.unwrap_or(6).to_string();
+                    cmd.args([
+                        "-f",
+                        "hls",
+                        "-hls_time",
+                        &hls_time,
+                        "-hls_segment_type",
+                        "fmp4",
+                        "-hls_fflags",
+                        "+split_by_time",
+                        "-hls_list_size",
+                        "0",
+                        "-hls_playlist_type",
+                        "vod",
+                        "-hls_fmp4_init_filename",
+                        "init.mp4",
+                        "-hls_segment_filename",
+                        &format!("{}/seg_%04d.m4s", hls_dir),
+                        "-y",
+                        &format!("{}/playlist.m3u8", hls_dir),
+                    ]);
+                } else {
+                    cmd.args([
+                        "-y",
+                        format!(
+                            "{}{}_ue.{}",
+                            *PATH_TO_TRANSCODED_FILE, file_name, format.ext
+                        )
+                        .as_str(),
+                    ]);
+                }
 
                 // Convert to Vec<String> instead of Vec<Cow<'_, str>>
                 let args: Vec<String> = cmd
@@ -360,14 +429,42 @@ fn run_ffmpeg(
                 if let Some(td) = trim_duration {
                     cmd.args(["-t", &format!("{:.3}", td)]);
                 }
-                add_arg(
-                    &mut cmd,
-                    "-y",
-                    Some(&format!(
-                        "{}{}_ue.{}",
-                        *PATH_TO_TRANSCODED_FILE, file_name, format.ext
-                    )),
-                );
+                if format.hls.unwrap_or(false) {
+                    let hls_dir = hls_output_dir(file_name);
+                    std::fs::create_dir_all(&hls_dir).map_err(|e| {
+                        Status::new(Code::Internal, format!("Failed to create HLS dir: {}", e))
+                    })?;
+                    let hls_time = format.hls_time.unwrap_or(6).to_string();
+                    cmd.args([
+                        "-f",
+                        "hls",
+                        "-hls_time",
+                        &hls_time,
+                        "-hls_segment_type",
+                        "fmp4",
+                        "-hls_fflags",
+                        "+split_by_time",
+                        "-hls_list_size",
+                        "0",
+                        "-hls_playlist_type",
+                        "vod",
+                        "-hls_fmp4_init_filename",
+                        "init.mp4",
+                        "-hls_segment_filename",
+                        &format!("{}/seg_%04d.m4s", hls_dir),
+                        "-y",
+                        &format!("{}/playlist.m3u8", hls_dir),
+                    ]);
+                } else {
+                    add_arg(
+                        &mut cmd,
+                        "-y",
+                        Some(&format!(
+                            "{}{}_ue.{}",
+                            *PATH_TO_TRANSCODED_FILE, file_name, format.ext
+                        )),
+                    );
+                }
             } else {
                 return Err(Status::new(
                     Code::InvalidArgument,
@@ -390,7 +487,12 @@ fn run_ffmpeg(
             if let Ok(line) = line_result {
                 if let Some(progress) = parse_progress(&line, progress_duration) {
                     last_progress = progress;
-                    shared::update_progress(&task_id, format_index, last_progress);
+                    let scaled_progress = if format.hls.unwrap_or(false) {
+                        (last_progress as f64 * 0.7) as i32
+                    } else {
+                        last_progress
+                    };
+                    shared::update_progress(&task_id, format_index, scaled_progress);
                 }
                 println!("£££££ {} £££££", line);
                 println!("Progress: {}%", last_progress);
@@ -400,6 +502,13 @@ fn run_ffmpeg(
 
     let output = child.wait().expect("Transcode process wasn't running");
     println!("Transcode finished with status: {}", output);
+
+    if !output.success() {
+        return Err(Status::new(
+            Code::Internal,
+            format!("FFmpeg exited with status: {}", output),
+        ));
+    }
 
     Ok(())
 }
@@ -427,6 +536,7 @@ pub async fn transcode_video(
     video_format: &str,
     is_encrypted: bool,
     is_gpu: bool,
+    preview_percent: u32,
 ) -> Result<Response<TranscodeVideoResponse>, Status> {
     println!("transcode_video: Processing video at: {}", file_path);
     println!("transcode_video: video_format: {}", video_format);
@@ -460,6 +570,7 @@ pub async fn transcode_video(
     let encrypt_flag = format.encrypt.unwrap_or(is_encrypted);
     println!("transcode_video: encrypt_flag: {}", encrypt_flag);
 
+    let task_id_clone = task_id.clone();
     run_ffmpeg(
         task_id,
         format_index,
@@ -469,6 +580,32 @@ pub async fn transcode_video(
         &format,
         total_duration,
     )?;
+
+    if format.hls.unwrap_or(false) {
+        let hls_dir = hls_output_dir(&file_name);
+        let hls_result = crate::hls_segment::process_hls_segments(
+            &task_id_clone,
+            format_index,
+            &hls_dir,
+            preview_percent,
+            format.dest.clone(),
+        )
+        .await
+        .map_err(|e| {
+            Status::new(
+                Code::Internal,
+                format!("HLS segment processing failed: {}", e),
+            )
+        })?;
+        let hls_json = serde_json::to_string(&hls_result)
+            .map_err(|e| Status::new(Code::Internal, e.to_string()))?;
+        return Ok(Response::new(TranscodeVideoResponse {
+            status_code: 200,
+            message: "HLS transcoding successful".into(),
+            cid: hls_json,
+            duration: total_duration,
+        }));
+    }
 
     if encrypt_flag {
         match encrypt_file_xchacha20(
@@ -763,5 +900,82 @@ mod tests {
             src.contains("trim_percent: Option<u8>"),
             "VideoFormat must have trim_percent field"
         );
+    }
+
+    #[test]
+    fn test_video_format_deserializes_hls_true() {
+        let json = r#"{"id": 1, "ext": "mp4", "hls": true, "hls_time": 6}"#;
+        let format: VideoFormat = serde_json::from_str(json).unwrap();
+        assert_eq!(format.hls, Some(true));
+        assert_eq!(format.hls_time, Some(6));
+    }
+
+    #[test]
+    fn test_video_format_hls_absent_is_none() {
+        let json = r#"{"id": 1, "ext": "mp4"}"#;
+        let format: VideoFormat = serde_json::from_str(json).unwrap();
+        assert!(format.hls.is_none());
+        assert!(format.hls_time.is_none());
+    }
+
+    #[test]
+    fn test_video_format_hls_time_defaults() {
+        let json = r#"{"id": 1, "ext": "mp4", "hls": true}"#;
+        let format: VideoFormat = serde_json::from_str(json).unwrap();
+        assert_eq!(format.hls, Some(true));
+        assert_eq!(format.hls_time.unwrap_or(6), 6);
+    }
+
+    #[test]
+    fn test_video_format_hls_false_is_noop() {
+        let json = r#"{"id": 1, "ext": "mp4", "hls": false}"#;
+        let format: VideoFormat = serde_json::from_str(json).unwrap();
+        assert_eq!(format.hls.unwrap_or(false), false);
+    }
+
+    #[test]
+    fn test_run_ffmpeg_has_hls_segment_type() {
+        let src = include_str!("transcode_video.rs");
+        assert!(
+            src.contains("hls_segment_type"),
+            "must have hls_segment_type flag"
+        );
+        assert!(src.contains("fmp4"), "must specify fmp4 segment type");
+    }
+
+    #[test]
+    fn test_run_ffmpeg_has_hls_time() {
+        let src = include_str!("transcode_video.rs");
+        assert!(src.contains("hls_time"), "must have hls_time flag");
+    }
+
+    #[test]
+    fn test_run_ffmpeg_has_hls_segment_filename() {
+        let src = include_str!("transcode_video.rs");
+        assert!(
+            src.contains("hls_segment_filename"),
+            "must have hls_segment_filename flag"
+        );
+        assert!(src.contains("seg_%04d.m4s"), "must use seg_%04d.m4s naming");
+    }
+
+    #[test]
+    fn test_run_ffmpeg_has_hls_list_size_zero() {
+        let src = include_str!("transcode_video.rs");
+        assert!(
+            src.contains("hls_list_size"),
+            "must have hls_list_size flag"
+        );
+        assert!(src.contains(r#""0""#), "must set hls_list_size to 0");
+    }
+
+    #[test]
+    fn test_transcode_video_has_hls_branch() {
+        let src = include_str!("transcode_video.rs");
+        assert!(
+            src.contains("process_hls_segments"),
+            "must call process_hls_segments"
+        );
+        assert!(src.contains("hls_output_dir"), "must use hls_output_dir");
     }
 }

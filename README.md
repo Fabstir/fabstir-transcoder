@@ -1,192 +1,198 @@
-# Fabstir transcoder
+# Fabstir Transcoder
 
 ## Summary
 
-This transcoder server can convert from any video format ffmpeg supports to AV1 codec. AV1 is an open-source, royalty-free video codec that has better compression than h264 with smaller file sizes and hence less bandwidth. There is also support to transcode to h264, higher resolutions and frame rates.
-AV1 is already supported by a number of popular browsers, including Google Chrome, Mozilla Firefox, and Microsoft Edge. It is also supported by a growing number of video players and streaming services.
+A Rust video/audio transcoding server that converts media to AV1/H.264 codecs using FFmpeg, with support for GPU acceleration (NVIDIA NVENC), file encryption (XChaCha20-Poly1305), and decentralised storage via S5 (Sia) and IPFS.
 
-## Encoding
+The server supports two output modes:
+- **Single-file** — one output file per format (existing behaviour)
+- **HLS fMP4 segments** — 6-second fMP4 segments per format with per-segment encryption based on a preview boundary, enabling adaptive bitrate streaming
 
-AV1 compression requires much more complexity than h264. Even with top of the line CPU, encoding rates are much less than real-time. Hardware encoding is realistically required and this is available on GPUs such as NVIDIA RTX 4000 series, NVIDIA A6000 or Intel Arc GPUs.
+AV1 is an open-source, royalty-free video codec with better compression than H.264 — smaller file sizes and less bandwidth. Hardware encoding via NVIDIA NVENC (RTX 4000+ for AV1, RTX 2000+ for H.264) makes real-time and faster-than-real-time transcoding feasible.
 
 ## Encryption
 
-The transcoder offers two forms of operation; either the source video is encrypted and the transcoder will also encrypt the transcoded videos, or the source video is not encrypted thus the transcoded videos will not be encrypted.
+The transcoder supports XChaCha20-Poly1305 encryption. In single-file mode, the `encrypt` per-format flag controls whether each output is encrypted. In HLS mode, the request-level `preview_percent` parameter determines which segments are unencrypted (free preview) and which are encrypted (paid content). Encrypted CIDs embed the decryption key — the CID itself is the access credential.
 
-## Technology used
+## Technology
 
-The transcoder network integrates to S5 for its content delivery network (CDN) and its ability to store content to Sia cloud storage.
+The transcoder integrates with S5 for its content delivery network and Sia cloud storage.
 
-S5 is a content-addressed storage network similar to IPFS, but with some new concepts and ideas to make it more efficient and powerful.
-https://github.com/s5-dev
+S5 is a content-addressed storage network similar to IPFS, with concepts to make it more efficient and powerful. https://github.com/s5-dev
 
-Sia is a decentralized cloud storage platform that uses blockchain technology to store data https://sia.tech/. It is designed to be more secure, reliable, and affordable than traditional cloud storage providers. Sia encrypts and distributes your files across a decentralized network of hosts. This means that your data is not stored in a single location, and it is not accessible to anyone who does not have the encryption key.
+Sia is a decentralized cloud storage platform that uses blockchain technology https://sia.tech/.
 
-# Overall workflow
+## Overall Workflow
 
 ![Fabstir Transcoder Workflow](https://fabstir.com/img2/Fabstir_transcoder_workflow.svg)
 
-The user submits a POST request to the trancode RESTful API, including a payload with the `cid` (content identifier) and an array of media formats to transcode to. The transcoder supports two storage solutions for the transcoded videos: Sia via the S5 content-addressed storage layer and IPFS. The user can choose whether to encrypt the transcoded videos and whether to use GPUs or CPUs for transcoding.
+1. Submit a POST request to `/transcode` with a `source_cid` and an array of media formats
+2. The server responds with a `task_id`
+3. The transcoder downloads the source, transcodes per format, encrypts if needed, and uploads outputs
+4. Poll `GET /get_transcoded/{task_id}` until `progress == 100`
+5. Parse the `metadata` JSON array — each format has a `cid` (single-file) or `segments[]` array (HLS)
 
-Upon receiving the request, the transcoder server responds with a JSON message, including a `status_code` and a `task_id`. The `status_code` indicates whether the transcoder received the request, and the `task_id` is a unique identifier for the transcoding request. _Note that the `task_id`, is currently the `cid` but it will be changed to a unique identifier in the next version of the transcoder._
+For HLS formats, FFmpeg outputs fMP4 segments. Each segment is uploaded individually to S5 with per-segment encryption decisions based on `preview_percent`. The response includes segment CIDs, durations, and encryption status. The SDK generates `.m3u8` playlists from the returned data.
 
-The transcoder server then transcodes the source video into each of the specified formats and uploads the transcoded videos to the specified storage solution.
+## Getting Started
 
-The user can query the status of the transcoding job by calling the `get_transcoded` RESTful API endpoint with the `task_id` as a parameter. If the `task_id` is not valid, the user receives a 404 `status_code`. If the transcoding job has not finished then the `progress` integer value returned will be less than 100 and the `metadata` media formats array will be empty. If the transcoding job has finished, the user receives a `progress` of 100 and the `metadata` array of media format JSON objects where each media format object has an additional `src` property that gives the `cid` of the video, prefixed with either `s5://` or `ipfs://` to indicate the storage location.
-
-# To get started
-
-```
+```bash
 cd transcode_server
 cargo build
-cargo run transcode-server
+cargo run --bin transcode-server
 ```
 
-# To use for video
+Requires: FFmpeg, protobuf compiler (`protoc`). See [docs/API.md](docs/API.md) for full API reference and environment variable configuration.
 
-Either use http/2:
-The `.proto` file
+## API
 
-```
+The server exposes both REST (port 8000) and gRPC (port 50051) interfaces.
+
+### Proto Definition
+
+```protobuf
 message TranscodeRequest {
     string source_cid = 1;
     string media_formats = 2;
     bool is_encrypted = 3;
     bool is_gpu = 4;
+    uint32 preview_percent = 5;
 }
 
 message TranscodeResponse {
     int32 status_code = 1;
     string message = 2;
-    string cid = 3;
+    string task_id = 3;
 }
 
 service TranscodeService {
     rpc Transcode(TranscodeRequest) returns (TranscodeResponse);
-
     rpc GetTranscoded(GetTranscodedRequest) returns (GetTranscodedResponse);
 }
 
 message GetTranscodedRequest {
-    string source_cid = 1;
+    string task_id = 1;
 }
 
 message GetTranscodedResponse {
     int32 status_code = 1;
     string metadata = 2;
     int32 progress = 3;
+    double duration = 4;
 }
 ```
 
-Or http/1:
-use port: 50051
+### REST Endpoints
 
-```
-      const isEncrypted = false;
-      const isGPU = true;
-      const cid = `${PORTAL_URL}/s5/blob/${uploadedFileCID}`;
+| Method | Endpoint | Auth | Purpose |
+|--------|----------|------|---------|
+| `GET` | `/health` | No | Health check |
+| `GET` | `/status` | JWT | Active/queued/max job counts |
+| `POST` | `/transcode` | JWT | Submit transcoding job |
+| `GET` | `/get_transcoded/{task_id}` | JWT | Poll job progress and results |
 
-      const videoFormats = [
-        {
-          id: 32,
-          label: "1080p",
-          type: "video/mp4",
-          ext: "mp4",
-          vcodec: "av1_nvenc",
-          preset: "medium",
-          profile: "main",
-          ch: 2,
-          vf: "scale=1920x1080",
-          b_v: "4.5M",
-          ar: "44k",
-          gpu: true,
-          dest: "s5",
-        },
-        {
-          id: 34,
-          label: '2160p',
-          type: 'video/mp4',
-          ext: 'mp4',
-          vcodec: 'av1_nvenc',
-          preset: 'slower',
-          profile: 'high',
-          ch: 2,
-          vf: 'scale=3840x2160',
-          b_v: '18M',
-          ar: '48k',
-          gpu: true,
-          dest: "ipfs",
-        },
-      ];
+### Video Example
 
-const url = `${TRANSCODER_CLIENT_URL}/transcode?source_cid=${cid}&media_formats=${videoFormatsJSON}&is_encrypted=${isEncrypted}&is_gpu=${isGPU}`;
-try {
-        const response = await fetch(url, { method: "POST" });
-        const data = await response.json();
-      } catch (error) {
-        console.error(error);
-      }
+```javascript
+const videoFormats = [
+  {
+    id: 32,
+    label: "1080p",
+    type: "video/mp4",
+    ext: "mp4",
+    vcodec: "av1_nvenc",
+    preset: "medium",
+    profile: "main",
+    ch: 2,
+    vf: "scale=1920x1080",
+    b_v: "4.5M",
+    ar: "44k",
+    gpu: true,
+    dest: "s5",
+  },
+];
+
+const url = `${TRANSCODER_URL}/transcode?source_cid=${cid}&media_formats=${JSON.stringify(videoFormats)}&is_encrypted=false&is_gpu=true`;
+const response = await fetch(url, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+const data = await response.json();
+// data.task_id → poll with /get_transcoded/{task_id}
 ```
 
-For example JavaScript code that uses transcoder, go [here](https://github.com/Fabstir/upload-play-example)
+### HLS Adaptive Streaming Example
 
-# To use for audio
+```javascript
+const hlsFormats = [
+  { id: 1, ext: "mp4", vcodec: "av1_nvenc", vf: "scale=1920x1080", b_v: "5M", hls: true, hls_time: 6, gpu: true },
+  { id: 2, ext: "mp4", vcodec: "av1_nvenc", vf: "scale=1280x720", b_v: "2.5M", hls: true, hls_time: 6, gpu: true },
+  { id: 3, ext: "mp4", vcodec: "av1_nvenc", vf: "scale=854x480", b_v: "1.15M", hls: true, hls_time: 6, gpu: true },
+];
 
-Or http/1:
-use port: 50051
-
-```
-      const isEncrypted = false;
-      const isGPU = false;
-      const cid = `${PORTAL_URL}/s5/blob/${uploadedFileCID}`;
-
-      const audioFormats = [
-      {
-        id: 16,
-        label: "1600k",
-        type: "audio/flac",
-        ext: "flac",
-        acodec: "flac",
-        ch: 2,
-        ar: "48k",
-      },
-      ];
-
-const url = `${TRANSCODER_CLIENT_URL}/transcode?source_cid=${cid}&media_formats=${audioFormatsJSON}&is_encrypted=${isEncrypted}&is_gpu=${isGPU}`;
-try {
-        const response = await fetch(url, { method: "POST" });
-        const data = await response.json();
-      } catch (error) {
-        console.error(error);
-      }
+// preview_percent=15 → first 15% of segments unencrypted, rest encrypted
+const url = `${TRANSCODER_URL}/transcode?source_cid=${cid}&media_formats=${JSON.stringify(hlsFormats)}&is_encrypted=true&is_gpu=true&preview_percent=15`;
 ```
 
-For example React program code that uses transcoder, go [here](https://github.com/Fabstir/upload-play-audio-example)
+The response for each HLS format includes:
+```json
+{
+  "id": 1, "ext": "mp4", "vcodec": "av1_nvenc", "hls": true,
+  "initSegmentCid": "s5://uEiB...",
+  "segments": [
+    { "index": 0, "cid": "s5://uEiC...", "duration": 6.006, "encrypted": false },
+    { "index": 15, "cid": "s5://uEiD...", "duration": 6.006, "encrypted": true }
+  ],
+  "previewSegments": 15,
+  "totalSegments": 100,
+  "totalDuration": 598.764
+}
+```
 
-# Media format properties
+### Audio Example
 
-The two previous sections show example JSON files that specify the transcoded media formats to output from a source file. These are the JSON file object properties currently supported (some have a direct one-to-one relationship with ffmpeg):
-id: u32,
-ext: String,
-vcodec: Option&lt;String&gt;,
-acodec: Option&lt;String&gt;,
-preset: Option&lt;String&gt;,
-profile: Option&lt;String&gt;,
-ch: Option<u8>,
-vf: Option<String>,
-b_v: Option<String>,
-ar: Option<String>,
-minrate: &lt;String&gt;,
-maxrate: &lt;String&gt;,
-bufsize: &lt;String&gt;,
-gpu: Option<bool>,
-compression_level: &lt;Option<u8>&gt;,
-dest: &lt;String&gt;,
+```javascript
+const audioFormats = [
+  { id: 16, label: "1600k", type: "audio/flac", ext: "flac", acodec: "flac", ch: 2, ar: "48k" },
+];
 
-Note that `dest` can be specfied for each output format type as either "s5" for uploading transcoded files to Sia via S5, "ipfs" for InterPlanetary File System or missed out from the JSON file where it will default to s5.
+const url = `${TRANSCODER_URL}/transcode?source_cid=${cid}&media_formats=${JSON.stringify(audioFormats)}&is_encrypted=false&is_gpu=false`;
+```
 
-# Caching
+For example JavaScript code that uses the transcoder, go [here](https://github.com/Fabstir/upload-play-example).
 
-The transcoder now checks to see if a source media file has already been downloaded. If so and it is still available in its cache area, it will not download again but use the local version. Similarly, if a file for a specific media format has already been transcoded and is still available in the cache area, then transcoding of the source media file for that particular format will be skipped and the local version uploaded instead.
+## Media Format Properties
 
-In the `.env` file, set FILE_SIZE_THRESHOLD and TRANSCODED_FILE_SIZE_THRESHOLD to the size in bytes, above which files in the cache get deleted; starting from oldest file first. GARBAGE_COLLECTOR_INTERVAL is the polling frequency in seconds for how often these thresholds are checked.
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | u32 | Unique format identifier (required) |
+| `ext` | String | Output file extension, e.g. "mp4", "opus", "flac" (required) |
+| `vcodec` | Option\<String\> | Video codec: `av1_nvenc`, `libx264`, `libx265` |
+| `acodec` | Option\<String\> | Audio codec: `libopus`, `flac`, `aac` |
+| `preset` | Option\<String\> | Encoding preset, e.g. "medium", "slower" |
+| `profile` | Option\<String\> | Encoding profile, e.g. "main", "high" |
+| `ch` | Option\<u8\> | Audio channels (e.g. 2 for stereo) |
+| `vf` | Option\<String\> | Video filter, e.g. "scale=1920x1080" |
+| `b_v` | Option\<String\> | Video bitrate, e.g. "3.5M" |
+| `b_a` | Option\<String\> | Audio bitrate, e.g. "128k" |
+| `c_a` | Option\<String\> | Audio codec (alternative to `acodec`) |
+| `ar` | Option\<String\> | Audio sample rate, e.g. "48k" |
+| `minrate` | Option\<String\> | Minimum video bitrate |
+| `maxrate` | Option\<String\> | Maximum video bitrate |
+| `bufsize` | Option\<String\> | Video buffer size |
+| `gpu` | Option\<bool\> | Per-format GPU override |
+| `compression_level` | Option\<u8\> | Audio compression level (for FLAC) |
+| `dest` | Option\<String\> | Storage destination: `"s5"` (default) or `"ipfs"` |
+| `encrypt` | Option\<bool\> | Per-format encryption override (single-file mode) |
+| `trim_percent` | Option\<u8\> | Keep only first N% of duration (1-99, single-file mode) |
+| `hls` | Option\<bool\> | Output fMP4 segments instead of single file |
+| `hls_time` | Option\<u32\> | Segment duration in seconds (default 6, HLS mode only) |
+
+## Caching
+
+The transcoder checks if a source media file has already been downloaded. If so and it is still available in cache, it will use the local version. Similarly, if a file for a specific format has already been transcoded and is still available in cache, transcoding for that format will be skipped.
+
+In the `.env` file, set `FILE_SIZE_THRESHOLD` and `TRANSCODED_FILE_SIZE_THRESHOLD` to the size in bytes above which cached files get deleted (oldest first). `GARBAGE_COLLECTOR_INTERVAL` is the polling frequency in seconds. The garbage collector handles both single files and HLS segment directories.
+
+## Documentation
+
+- [API Reference](docs/API.md) — full REST/gRPC API documentation, examples, environment variables
+- [Project Overview](docs/fabstir-transcoder-overview.md) — architecture, capabilities, Fabstir v2 integration
+- [HLS Transcoder Spec](docs/node-reference/HLS-TRANSCODER-SPEC.md) — node developer specification for HLS support
