@@ -300,17 +300,11 @@ fn run_ffmpeg(
             ]);
         }
 
-        // Convert to Vec<String> instead of Vec<Cow<'_, str>>
         let args: Vec<String> = cmd
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         println!("ffmpeg {}", args.join(" "));
-
-        // Now String implements AsRef<OsStr>
-        for arg in args {
-            cmd.arg(arg);
-        }
     } else {
         if let Some(vcodec) = &format.vcodec {
             if !vcodec.is_empty() {
@@ -394,17 +388,11 @@ fn run_ffmpeg(
                     ]);
                 }
 
-                // Convert to Vec<String> instead of Vec<Cow<'_, str>>
                 let args: Vec<String> = cmd
                     .get_args()
                     .map(|arg| arg.to_string_lossy().into_owned())
                     .collect();
                 println!("ffmpeg {}", args.join(" "));
-
-                // Now String implements AsRef<OsStr>
-                for arg in args {
-                    cmd.arg(arg);
-                }
             } else {
                 return Err(Status::new(
                     Code::InvalidArgument,
