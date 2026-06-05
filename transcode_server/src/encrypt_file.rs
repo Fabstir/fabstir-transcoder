@@ -59,7 +59,7 @@ fn encrypt_file_xchacha20_internal<R: Read>(
 
         let ciphertext = cipher.encrypt(&nonce, &buffer[..length]);
 
-        output_file.write(&ciphertext.unwrap()).unwrap();
+        output_file.write_all(&ciphertext.unwrap()).unwrap();
         chunk_index = chunk_index + 1;
     }
 
@@ -118,10 +118,10 @@ fn decrypt_file_xchacha20_internal<R: Read>(
 
         if chunk_index == last_chunk_index {
             output_file
-                .write(&ciphertext.unwrap()[..(count - 16 - padding)])
+                .write_all(&ciphertext.unwrap()[..(count - 16 - padding)])
                 .unwrap();
         } else {
-            output_file.write(&ciphertext.unwrap()).unwrap();
+            output_file.write_all(&ciphertext.unwrap()).unwrap();
         }
 
         chunk_index = chunk_index + 1;
@@ -178,13 +178,13 @@ fn decrypt_file_xchacha20_internal2<R: Read>(
             Ok(ciphertext) => {
                 if chunk_index == last_chunk_index {
                     output_file
-                        .write(&ciphertext[..(count - 16 - padding)])
+                        .write_all(&ciphertext[..(count - 16 - padding)])
                         .unwrap();
 
                 //                    output_file.write_all(&ciphertext[..(count - 16 - padding)])?;
                 } else {
                     println!("output_file.write(&ciphertext.unwrap()).unwrap();");
-                    output_file.write(&ciphertext).unwrap();
+                    output_file.write_all(&ciphertext).unwrap();
                     //        output_file.write_all(&ciphertext)?;
                     println!("after output_file.write(&ciphertext.unwrap()).unwrap();");
                 }
@@ -199,7 +199,7 @@ fn decrypt_file_xchacha20_internal2<R: Read>(
         //         .unwrap();
         // } else {
         //     println!("output_file.write(&ciphertext.unwrap()).unwrap();");
-        //                output_file.write(&ciphertext.unwrap()).unwrap();
+        //                output_file.write_all(&ciphertext.unwrap()).unwrap();
         //     println!("after output_file.write(&ciphertext.unwrap()).unwrap();");
         // }
 

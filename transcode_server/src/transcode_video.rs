@@ -1,3 +1,4 @@
+use crate::moderation;
 use crate::shared;
 
 use crate::encrypt_file::encrypt_file_xchacha20;
@@ -177,6 +178,141 @@ pub fn hls_output_dir(file_name: &str) -> String {
     format!("{}{}_hls", *PATH_TO_TRANSCODED_FILE, file_name)
 }
 
+// ── Moderation keyframe tap (A1) ───────────────────────────────────────────────
+// `modtap_dir`/`source_has_video`/`tap_source_keyframes` are called from the
+// Phase-5 gate in server.rs.
+
+/// Downscale the moderation tap to a ≤512px long edge. PDQ runs at 64×64 so this is
+/// node-transparent, and it bounds the in-memory keyframe set (the Phase-5 gate reads
+/// every tap PNG at once) regardless of source resolution. `min(512,iw)` never upscales;
+/// `-2` keeps aspect with an even dimension. Quoted so the inner comma is not parsed as
+/// a filter separator.
+const TAP_SCALE: &str = "scale='min(512,iw)':-2";
+
+/// Per-job directory holding the sampled moderation keyframe PNGs.
+pub fn modtap_dir(task_id: &str) -> String {
+    format!("{}{}_modtap", *PATH_TO_TRANSCODED_FILE, task_id)
+}
+
+/// True if the source has at least one video stream. ffprobe-based; on ANY
+/// error/ambiguity returns `true` (fail-closed — a probe false-negative must never
+/// make a video source look audio-only).
+pub fn source_has_video(path: &str) -> bool {
+    match Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+            path,
+        ])
+        .output()
+    {
+        // Only a CLEAN, successful probe that affirmatively reports no video stream may
+        // say audio-only. A non-zero exit (I/O error, partially-corrupt container, FS
+        // hiccup) leaves stdout empty under `-v error`, which must NOT read as audio-only.
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| l.trim() == "video"),
+        _ => true, // spawn failure OR non-zero exit ⇒ assume video ⇒ fail-closed (HOLD)
+    }
+}
+
+/// Dedicated keyframe extraction for a video SOURCE whose requested outputs are
+/// all audio (no transcode to tee from): its own ffmpeg child is the job's sole
+/// video decode. Spawn/wait failures AND a non-zero exit ⇒ `Err` (never panic),
+/// so the Phase-5 gate leaves `tap_ok = false` ⇒ HOLD.
+pub fn tap_source_keyframes(file_path: &str, tap_dir: &str) -> Result<(), Status> {
+    std::fs::create_dir_all(tap_dir)
+        .map_err(|e| Status::new(Code::Internal, format!("modtap dir: {}", e)))?;
+    let d = get_video_duration(file_path).unwrap_or(0.0);
+    let fps = format!(
+        "fps={:.5},{}",
+        1.0 / moderation::effective_interval(d),
+        TAP_SCALE
+    );
+    let out = format!("{}/kf_%05d.png", tap_dir);
+    let cap = moderation::keyframe_max().to_string(); // hard budget cap (see append_tap_post)
+    let status = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-i",
+            file_path,
+            "-vf",
+            fps.as_str(),
+            "-fps_mode",
+            "vfr",
+            "-frames:v",
+            cap.as_str(),
+            "-y",
+            out.as_str(),
+        ])
+        .status()
+        .map_err(|e| Status::new(Code::Internal, format!("source tap spawn: {}", e)))?;
+    if !status.success() {
+        return Err(Status::new(
+            Code::Internal,
+            format!("source tap ffmpeg exited: {}", status),
+        ));
+    }
+    Ok(())
+}
+
+/// A `format.vf` is "foldable" into the tap filtergraph only if it is a simple
+/// comma-chain — no `;`/`[`/`]` graph separators or pad labels that could collide
+/// with the reserved `[s]/[t]/[m]/[k]` labels (a graph-injection / fail-open risk;
+/// `vf` rides in the request `media_formats` JSON). `None` (no filter) ⇒ foldable.
+/// Used by both `run_ffmpeg` (do_tap) and the Phase-5 gate's tap-owner pick.
+/// 1.72-compatible (avoids `Option::is_none_or`, which is 1.82+).
+pub fn vf_foldable(vf: Option<&str>) -> bool {
+    !matches!(vf, Some(s) if s.contains(';') || s.contains('[') || s.contains(']'))
+}
+
+/// Append the teed keyframe filtergraph + the main-output maps. MUST be emitted
+/// BEFORE the main `-y <output>` (the `-map`s bind to that next output). The encode
+/// branch keeps the requested `format.vf`; the tap branch is sampled then downscaled
+/// (`TAP_SCALE`) so the published video is unaffected and the keyframe set stays small.
+fn append_tap_pre(cmd: &mut Command, vf: Option<&str>, fps: &str) {
+    let graph = match vf {
+        Some(vf) => format!(
+            "[0:v]split=2[s][t];[s]{}[m];[t]fps={},{}[k]",
+            vf, fps, TAP_SCALE
+        ),
+        None => format!("[0:v]split=2[m][t];[t]fps={},{}[k]", fps, TAP_SCALE),
+    };
+    cmd.args([
+        "-filter_complex",
+        graph.as_str(),
+        "-map",
+        "[m]",
+        "-map",
+        "0:a:0?", // first audio stream (optional) — matches default single-stream selection
+    ]);
+}
+
+/// Append the keyframe PNG tap output. MUST follow the main `-y <output>`.
+fn append_tap_post(cmd: &mut Command, dir: &str) {
+    let png = format!("{}/kf_%05d.png", dir);
+    // Hard budget cap (backstop): bounds frame production even if the duration probe
+    // fails (`0.0` ⇒ the adaptive interval can't widen). Never truncates a correctly
+    // probed source (count is already <= budget); prevents an unbounded-PNG OOM/disk DoS.
+    let cap = moderation::keyframe_max().to_string();
+    cmd.args([
+        "-map",
+        "[k]",
+        "-fps_mode",
+        "vfr",
+        "-frames:v",
+        cap.as_str(),
+        png.as_str(),
+    ]);
+}
+
 /// Executes the ffmpeg command to transcode a video file based on the specified parameters.
 /// This function supports GPU acceleration and handles various video formats.
 ///
@@ -192,6 +328,7 @@ pub fn hls_output_dir(file_name: &str) -> String {
 /// # Returns
 /// A `Result<(), Status>` indicating the success or failure of the transcoding operation.
 ///
+#[allow(clippy::too_many_arguments)]
 fn run_ffmpeg(
     task_id: String,
     format_index: usize,
@@ -200,6 +337,7 @@ fn run_ffmpeg(
     is_gpu: bool,
     format: &VideoFormat,
     total_duration: f64,
+    tap_dir: Option<&str>,
 ) -> Result<(), Status> {
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-v").arg("info");
@@ -220,6 +358,28 @@ fn run_ffmpeg(
     };
     // Progress should track against trimmed duration, not full source
     let progress_duration = trim_duration.unwrap_or(total_duration);
+
+    // Moderation tap (A1): a teed keyframe side-output on the SAME ffmpeg command.
+    // `do_tap` also requires a foldable `vf` (no graph-injection) and a video codec;
+    // a non-foldable `vf` emits no tap → the Phase-5 gate HOLDs the (unscaled,
+    // never-published) job.
+    let do_tap = tap_dir.is_some()
+        && vf_foldable(format.vf.as_deref())
+        && format.vcodec.as_deref().is_some_and(|v| !v.is_empty());
+    let fps_str = format!(
+        "{:.5}",
+        1.0 / moderation::effective_interval(total_duration)
+    );
+    if do_tap {
+        // audit line — deterministic, reproducible sample (spec §5)
+        println!(
+            "moderation tap: fps={}, interval={}s, budget={}, duration={}s",
+            fps_str,
+            moderation::effective_interval(total_duration),
+            moderation::keyframe_max(),
+            total_duration
+        );
+    }
 
     if is_gpu {
         println!(
@@ -248,8 +408,10 @@ fn run_ffmpeg(
         if let Some(ar) = format.ar.as_deref() {
             add_arg(&mut cmd, "-ar", Some(ar));
         }
-        if let Some(vf) = format.vf.as_deref() {
-            add_arg(&mut cmd, "-vf", Some(vf));
+        if tap_dir.is_none() {
+            if let Some(vf) = format.vf.as_deref() {
+                add_arg(&mut cmd, "-vf", Some(vf));
+            }
         }
         if let Some(ref minrate) = format.minrate {
             cmd.args(["-minrate", minrate]);
@@ -262,6 +424,12 @@ fn run_ffmpeg(
         }
         if let Some(td) = trim_duration {
             cmd.args(["-t", &format!("{:.3}", td)]);
+        }
+        if do_tap {
+            let dir = tap_dir.unwrap();
+            std::fs::create_dir_all(dir)
+                .map_err(|e| Status::new(Code::Internal, format!("modtap dir: {}", e)))?;
+            append_tap_pre(&mut cmd, format.vf.as_deref(), &fps_str);
         }
         if format.hls.unwrap_or(false) {
             let hls_dir = hls_output_dir(file_name);
@@ -336,8 +504,10 @@ fn run_ffmpeg(
                 if let Some(ar) = format.ar.as_deref() {
                     add_arg(&mut cmd, "-ar", Some(ar));
                 }
-                if let Some(vf) = format.vf.as_deref() {
-                    add_arg(&mut cmd, "-vf", Some(vf));
+                if tap_dir.is_none() {
+                    if let Some(vf) = format.vf.as_deref() {
+                        add_arg(&mut cmd, "-vf", Some(vf));
+                    }
                 }
                 if let Some(ref minrate) = format.minrate {
                     cmd.args(["-minrate", minrate]);
@@ -350,6 +520,12 @@ fn run_ffmpeg(
                 }
                 if let Some(td) = trim_duration {
                     cmd.args(["-t", &format!("{:.3}", td)]);
+                }
+                if do_tap {
+                    let dir = tap_dir.unwrap();
+                    std::fs::create_dir_all(dir)
+                        .map_err(|e| Status::new(Code::Internal, format!("modtap dir: {}", e)))?;
+                    append_tap_pre(&mut cmd, format.vf.as_deref(), &fps_str);
                 }
                 if format.hls.unwrap_or(false) {
                     let hls_dir = hls_output_dir(file_name);
@@ -464,9 +640,17 @@ fn run_ffmpeg(
         }
     }
 
+    // Append the keyframe PNG tap output AFTER the main `-y <output>` (its `-map [k]`
+    // binds to this last output file).
+    if do_tap {
+        append_tap_post(&mut cmd, tap_dir.unwrap());
+    }
+
     cmd.stderr(Stdio::piped()).stdout(Stdio::null());
 
-    let mut child = cmd.spawn().expect("failed to start ffmpeg command");
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Status::new(Code::Internal, format!("ffmpeg spawn: {}", e)))?;
 
     if let Some(stderr) = child.stderr.take() {
         let reader = BufReader::new(stderr);
@@ -488,7 +672,9 @@ fn run_ffmpeg(
         }
     }
 
-    let output = child.wait().expect("Transcode process wasn't running");
+    let output = child
+        .wait()
+        .map_err(|e| Status::new(Code::Internal, format!("ffmpeg wait: {}", e)))?;
     println!("Transcode finished with status: {}", output);
 
     if !output.success() {
@@ -517,6 +703,24 @@ fn run_ffmpeg(
 /// A `Result` wrapping a `Response` with the `TranscodeVideoResponse` on success,
 /// or a `Status` error on failure.
 ///
+/// What `transcode_video_produce` makes, before any S5 upload. Carries everything
+/// `transcode_video_publish` needs plus `video_format` (the un-mutated catalogue
+/// entry) the Phase-5 gate uses to rebuild each deferred output's metadata.
+pub struct LocalOutput {
+    pub task_id: String,
+    pub format_index: usize,
+    pub file_name: String,
+    pub ext: String,
+    pub dest: Option<String>,
+    pub encrypt_flag: bool,
+    pub is_hls: bool,
+    pub total_duration: f64,
+    pub preview_percent: u32,
+    pub video_format: serde_json::Value,
+}
+
+/// Inline produce→publish wrapper — behaviour unchanged. Phase 5 calls produce and
+/// publish separately so the A4 gate can sit between them.
 pub async fn transcode_video(
     task_id: String,
     format_index: usize,
@@ -526,6 +730,32 @@ pub async fn transcode_video(
     is_gpu: bool,
     preview_percent: u32,
 ) -> Result<Response<TranscodeVideoResponse>, Status> {
+    let out = transcode_video_produce(
+        task_id,
+        format_index,
+        file_path,
+        video_format,
+        is_encrypted,
+        is_gpu,
+        preview_percent,
+        None,
+    )
+    .await?;
+    transcode_video_publish(out).await
+}
+
+/// Transcode (with an optional moderation tap) into local files, WITHOUT uploading.
+#[allow(clippy::too_many_arguments)]
+pub async fn transcode_video_produce(
+    task_id: String,
+    format_index: usize,
+    file_path: &str,
+    video_format: &str,
+    is_encrypted: bool,
+    is_gpu: bool,
+    preview_percent: u32,
+    tap_dir: Option<&str>,
+) -> Result<LocalOutput, Status> {
     println!("transcode_video: Processing video at: {}", file_path);
     println!("transcode_video: video_format: {}", video_format);
     println!("transcode_video: is_encrypted: {}", is_encrypted);
@@ -538,45 +768,68 @@ pub async fn transcode_video(
         .to_string();
 
     let format = get_video_format_from_str(video_format)?;
+    let video_format_value: serde_json::Value = serde_json::from_str(video_format)
+        .map_err(|e| Status::new(Code::Internal, format!("video_format json: {}", e)))?;
 
-    let file_name = format!("{}_{}", file_name, format.id.to_string());
+    let file_name = format!("{}_{}", file_name, format.id);
 
-    println!("Transcoding video: {}", &file_path);
-    println!("is_gpu = {}", &is_gpu);
-
-    let total_duration = get_video_duration(file_path).unwrap_or_else(|_| 0.0);
+    let total_duration = get_video_duration(file_path).unwrap_or(0.0);
     println!("Total video duration: {} seconds", total_duration);
 
-    let mut encryption_key1: Vec<u8> = Vec::new();
-
-    let response: TranscodeVideoResponse;
-
-    // Use format.gpu if it has a value, otherwise use is_gpu
     let gpu_flag = format.gpu.unwrap_or(is_gpu);
-    println!("transcode_video: gpu_flag: {}", gpu_flag);
-
     let encrypt_flag = format.encrypt.unwrap_or(is_encrypted);
-    println!("transcode_video: encrypt_flag: {}", encrypt_flag);
+    let is_hls = format.hls.unwrap_or(false);
 
-    let task_id_clone = task_id.clone();
     run_ffmpeg(
-        task_id,
+        task_id.clone(),
         format_index,
         file_path,
         &file_name,
         gpu_flag,
         &format,
         total_duration,
+        tap_dir,
     )?;
 
-    if format.hls.unwrap_or(false) {
+    Ok(LocalOutput {
+        task_id,
+        format_index,
+        file_name,
+        ext: format.ext,
+        dest: format.dest,
+        encrypt_flag,
+        is_hls,
+        total_duration,
+        preview_percent,
+        video_format: video_format_value,
+    })
+}
+
+/// Publish a produced output to S5. **The only code that writes to S5.**
+pub async fn transcode_video_publish(
+    out: LocalOutput,
+) -> Result<Response<TranscodeVideoResponse>, Status> {
+    let LocalOutput {
+        task_id,
+        format_index,
+        file_name,
+        ext,
+        dest,
+        encrypt_flag,
+        is_hls,
+        total_duration,
+        preview_percent,
+        video_format: _,
+    } = out;
+
+    if is_hls {
         let hls_dir = hls_output_dir(&file_name);
         let hls_result = crate::hls_segment::process_hls_segments(
-            &task_id_clone,
+            &task_id,
             format_index,
             &hls_dir,
             preview_percent,
-            format.dest.clone(),
+            dest.clone(),
         )
         .await
         .map_err(|e| {
@@ -595,13 +848,13 @@ pub async fn transcode_video(
         }));
     }
 
+    let mut encryption_key1: Vec<u8> = Vec::new();
+    let response: TranscodeVideoResponse;
+
     if encrypt_flag {
         match encrypt_file_xchacha20(
-            format!(
-                "{}{}_ue.{}",
-                *PATH_TO_TRANSCODED_FILE, file_name, format.ext
-            ),
-            format!("{}{}.{}", *PATH_TO_TRANSCODED_FILE, file_name, format.ext),
+            format!("{}{}_ue.{}", *PATH_TO_TRANSCODED_FILE, file_name, ext),
+            format!("{}{}.{}", *PATH_TO_TRANSCODED_FILE, file_name, ext),
             0,
         ) {
             Ok(bytes) => {
@@ -618,12 +871,8 @@ pub async fn transcode_video(
             }
         }
 
-        let file_path = format!(
-            "{}{}_ue.{}",
-            *PATH_TO_TRANSCODED_FILE, file_name, format.ext
-        );
-        let file_path_encrypted =
-            format!("{}{}.{}", *PATH_TO_TRANSCODED_FILE, file_name, format.ext);
+        let file_path = format!("{}{}_ue.{}", *PATH_TO_TRANSCODED_FILE, file_name, ext);
+        let file_path_encrypted = format!("{}{}.{}", *PATH_TO_TRANSCODED_FILE, file_name, ext);
 
         let hash_result = hash_blake3_file(file_path.clone());
         let hash_result_encrypted = hash_blake3_file(file_path_encrypted.to_owned());
@@ -634,7 +883,7 @@ pub async fn transcode_video(
         let padding: u32 = 0; // replace with your actual padding
 
         // Upload the transcoded videos to storage
-        match upload_video(file_path_encrypted.as_str(), format.dest).await {
+        match upload_video(file_path_encrypted.as_str(), dest).await {
             Ok(cid_encrypted) => {
                 println!(
                     "****************************************** cid: {:?}",
@@ -679,7 +928,15 @@ pub async fn transcode_video(
                 let cloned_hash = encrypted_blob_hash.clone();
 
                 let file_path_path = Path::new(&file_path);
-                let metadata = std::fs::metadata(file_path_path).expect("Failed to read metadata");
+                // Graceful Err (not panic): the deferred publish widens the window in
+                // which the GC could evict this intermediate; a missing file must drop
+                // the format, not crash the worker.
+                let metadata = std::fs::metadata(file_path_path).map_err(|e| {
+                    Status::new(
+                        Code::Internal,
+                        format!("read metadata for {}: {}", file_path, e),
+                    )
+                })?;
                 let file_size = metadata.len();
 
                 let cid = hash_bytes_to_cid(hash, file_size);
@@ -749,13 +1006,10 @@ pub async fn transcode_video(
             }
         };
     } else {
-        let file_path = format!(
-            "{}{}_ue.{}",
-            *PATH_TO_TRANSCODED_FILE, file_name, format.ext
-        );
+        let file_path = format!("{}{}_ue.{}", *PATH_TO_TRANSCODED_FILE, file_name, ext);
 
         // Upload the transcoded videos to storage
-        match upload_video(file_path.as_str(), format.dest.clone()).await {
+        match upload_video(file_path.as_str(), dest.clone()).await {
             Ok(cid) => {
                 println!("cid: {:?}", cid);
 
@@ -789,6 +1043,81 @@ pub async fn transcode_video(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_publish_is_only_s5_writer() {
+        let src = include_str!("transcode_video.rs");
+        // needles via concat! so this test's own literals don't self-match
+        let up = concat!("upload_video", "(");
+        let hls = concat!("process_hls_segments", "(");
+        let start = src
+            .find("pub async fn transcode_video_publish")
+            .expect("publish fn present");
+        // publish is the last fn before the test module
+        let end = src[start..]
+            .find("\n#[cfg(test)]")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let region = &src[start..end];
+        let before = &src[..start];
+        let after = &src[end..];
+        assert!(
+            region.contains(up) && region.contains(hls),
+            "both S5 writers live in publish"
+        );
+        assert!(
+            !before.contains(up) && !after.contains(up),
+            "upload_video only in publish"
+        );
+        assert!(
+            !before.contains(hls) && !after.contains(hls),
+            "hls writer only in publish"
+        );
+    }
+
+    #[test]
+    fn test_produce_takes_tap_dir() {
+        let src = include_str!("transcode_video.rs");
+        assert!(src.contains("transcode_video_produce"));
+        assert!(src.contains("tap_dir"));
+    }
+
+    #[test]
+    fn test_source_has_video_failclosed_on_probe_error() {
+        // A non-zero ffprobe exit (missing/corrupt path) — or ffprobe absent — must NOT
+        // read as audio-only; the A4 gate depends on this returning true (HOLD).
+        assert!(source_has_video("/nonexistent/definitely/not/a/file.xyz"));
+    }
+
+    #[test]
+    fn test_run_ffmpeg_tap_is_full_duration_side_output() {
+        let src = include_str!("transcode_video.rs");
+        assert!(src.contains("filter_complex"));
+        assert!(src.contains("effective_interval"));
+        assert!(src.contains("kf_%05d.png"));
+        assert!(src.contains("0:a:0?")); // audio preserved (first stream) on the tapped output
+                                         // budget enforced as a hard -frames:v cap (= keyframe_max); needle via concat!
+        assert!(
+            src.contains(concat!("-frames", ":v")),
+            "keyframe budget enforced as a hard -frames:v cap"
+        );
+        assert!(
+            !src.contains(concat!("-", "vsync")),
+            "tap must use fps_mode for cadence"
+        );
+        assert!(src.contains("-fps_mode"));
+        assert!(src.contains("tap_dir.is_none()")); // standalone -vf guarded when tapping
+    }
+
+    #[test]
+    fn test_tap_is_teed_not_a_second_pass() {
+        let src = include_str!("transcode_video.rs");
+        // the PNG tap is wired via the [k] label of the SAME command's filter_complex
+        // graph — teed off the single decode, not a second spawn.
+        assert!(src.contains("[k]"));
+        assert!(src.contains("kf_%05d.png"));
+        assert!(src.contains("split=2"));
+    }
 
     #[test]
     fn test_transcode_video_response_carries_duration() {

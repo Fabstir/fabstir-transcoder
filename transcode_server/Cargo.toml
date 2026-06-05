@@ -14,6 +14,7 @@ path = "src/server.rs"
 
 [dependencies]
 blake3 = "1.3.1"
+sha2 = "0.10"
 anyhow = "1.0.70"
 reqwest = "0.9"
 # tus_client = {version = "0.1.1", features = ["reqwest"]}

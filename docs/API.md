@@ -650,6 +650,26 @@ Configure the transcoder via a `.env` file in the `transcode_server/` directory.
 | `PINATA_API_SECRET` | Pinata IPFS API secret | (none) |
 | `PINATA_JWT` | Pinata IPFS JWT token | (none) |
 
+### Content Moderation (A4 fail-closed gate)
+
+These configure the transcoder's half of the CSAM hash-match publish gate. The gate is
+**dark by default** (`MODERATION_ENABLED` unset/`false` ⇒ no keyframe tap, no POST, uploads
+exactly as before). When enabled, no output is uploaded to S5 until the node returns a
+`cleared` verdict; node unreachable / error / timeout / non-2xx ⇒ **HOLD** (upload nothing).
+
+> **HARD RULE — dual-enforcement coupling.** The gate is only fully live when **both**
+> `MODERATION_ENABLED` (transcoder) and `MODERATION_ENFORCE` (node) are ON. Flip them
+> **together**: transcoder-ON/node-OFF can still bill a held job; transcoder-OFF/node-ON
+> lets bytes leave before a verdict.
+
+| Variable | Description | Default |
+|---|---|---|
+| `MODERATION_ENABLED` | Master switch for the A4 gate. `false` = dark-launch (byte-identical to today). | `false` |
+| `MODERATION_NODE_URL` | Base URL of the node's `POST /v1/moderate/frames`. Missing ⇒ HOLD. | (none) |
+| `MODERATION_TIMEOUT_SECS` | Seam-#1 POST timeout (seconds). On expiry ⇒ HOLD. | `30` |
+| `MODERATION_SAMPLE_INTERVAL_SECS` | Keyframe sampling floor interval (seconds); even full-duration sampling widens this to fit the budget. | `2.0` |
+| `MODERATION_KEYFRAME_MAX` | Keyframe budget. Drives even full-duration sampling (the interval widens to fit), and is also emitted as a hard `-frames:v` backstop that bounds frame production if the duration probe fails — it never truncates a correctly-probed source. | `300` |
+
 ---
 
 ## Deployment

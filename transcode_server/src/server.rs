@@ -20,9 +20,13 @@ mod utils;
 use utils::{base64url_to_bytes, bytes_to_base64url, download_and_concat_files, download_video};
 
 mod transcode_video;
-use transcode_video::{get_video_format_from_str, transcode_video, TranscodeVideoResponse};
+use transcode_video::{
+    get_video_format_from_str, transcode_video, transcode_video_produce, transcode_video_publish,
+    LocalOutput, TranscodeVideoResponse,
+};
 
 mod hls_segment;
+mod moderation;
 mod shared;
 
 use tonic::{transport::Server, Request, Response, Status};
@@ -381,6 +385,23 @@ async fn process_single_job(
     let mut transcoded_formats = Vec::new();
     let mut source_duration: f64 = 0.0;
 
+    // ── A4 content-moderation gate (dark behind MODERATION_ENABLED; default off) ──
+    let enabled = moderation::moderation_enabled();
+    let client = moderation::default_client();
+    let tap_dir = transcode_video::modtap_dir(&task_id);
+    // Probe the SOURCE (now on disk), not output codecs; `&&` short-circuits so a
+    // disabled run never spawns ffprobe. On probe error, source_has_video ⇒ true ⇒ HOLD.
+    let scan_required = enabled && transcode_video::source_has_video(&file_path);
+    if enabled {
+        // Defense-in-depth: clear any stale tap dir before producing this job's keyframes
+        // so the gate can never read a prior run's PNGs. (task_id is a fresh UUID, so this
+        // is belt-and-braces.) Dark-launch parity: guarded by `enabled`.
+        let _ = fs::remove_dir_all(&tap_dir);
+    }
+    let mut pending: Vec<LocalOutput> = Vec::new();
+    let mut tap_ok = !scan_required; // audio source: nothing to tap, empty set is clearable
+    let mut tapped = false; // has the tap been assigned to a video output yet?
+
     for (index, video_format) in media_formats_vec.iter().enumerate() {
         let video_format_str = match serde_json::to_string(&video_format) {
             Ok(str) => str,
@@ -399,80 +420,195 @@ async fn process_single_job(
             }
         };
 
-        if !check_transcoded_file_exists(
-            file_path.as_str(),
-            &format.id.to_string(),
-            format.ext.as_str(),
+        if !enabled {
+            // ── Dark-launch: legacy inline produce+publish, byte-identical to today ──
+            if !check_transcoded_file_exists(
+                file_path.as_str(),
+                &format.id.to_string(),
+                format.ext.as_str(),
+            )
+            .await
+            {
+                let transcode_result: Result<Response<TranscodeVideoResponse>, Status> =
+                    transcode_video(
+                        task_id.clone(),
+                        index,
+                        &file_path,
+                        &video_format_str,
+                        is_encrypted,
+                        is_gpu,
+                        preview_percent,
+                    )
+                    .await;
+
+                match transcode_result {
+                    Ok(transcode_video_response) => {
+                        let response = transcode_video_response.into_inner();
+                        if source_duration == 0.0 && response.duration > 0.0 {
+                            source_duration = response.duration;
+                        }
+                        println!(
+                            "Response: status_code: {}, message: {}, cid: {}",
+                            response.status_code, response.message, response.cid
+                        );
+                        if response.status_code != 200 {
+                            eprintln!(
+                                "Format {} failed with status {}: {}",
+                                index, response.status_code, response.message
+                            );
+                            continue;
+                        }
+                        let mut video_format_modified = video_format.clone();
+                        apply_cid_metadata(
+                            &mut video_format_modified,
+                            &response,
+                            format.hls.unwrap_or(false),
+                            &format.dest,
+                        );
+                        transcoded_formats.push(video_format_modified);
+                    }
+                    Err(e) => {
+                        eprintln!("Error transcoding video: {:?}", e);
+                        continue;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // ── Enabled: produce-only; publish is deferred until a `cleared` verdict ──
+        let fmt_has_video = video_format["vcodec"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty());
+        // The tap owner must ALSO have a foldable vf — a non-foldable-vf format emits no
+        // PNGs (run_ffmpeg's do_tap), so letting it claim the tap would permanently HOLD the
+        // job; instead a later foldable format or the source-tap fallback handles it.
+        let want_tap =
+            fmt_has_video && transcode_video::vf_foldable(video_format["vf"].as_str()) && !tapped;
+        // Cache short-circuit applies to non-tap formats only; the tap owner always
+        // re-emits a fresh keyframe set (never moderate a stale/empty cached dir).
+        if !want_tap
+            && check_transcoded_file_exists(
+                file_path.as_str(),
+                &format.id.to_string(),
+                format.ext.as_str(),
+            )
+            .await
+        {
+            continue;
+        }
+        let this_tap = if want_tap {
+            Some(tap_dir.as_str())
+        } else {
+            None
+        };
+        match transcode_video_produce(
+            task_id.clone(),
+            index,
+            &file_path,
+            &video_format_str,
+            is_encrypted,
+            is_gpu,
+            preview_percent,
+            this_tap,
         )
         .await
         {
-            let transcode_result: std::prelude::v1::Result<
-                Response<TranscodeVideoResponse>,
-                Status,
-            > = transcode_video(
-                task_id.clone(),
-                index,
-                &file_path,
-                &video_format_str,
-                is_encrypted,
-                is_gpu,
-                preview_percent,
-            )
-            .await;
+            Ok(out) => {
+                if want_tap {
+                    tapped = true;
+                    tap_ok = true; // the tap-owning ffmpeg run succeeded
+                }
+                pending.push(out);
+            }
+            Err(e) => {
+                eprintln!("Error producing format {}: {:?}", index, e);
+                if want_tap {
+                    tapped = true; // tap owner attempted+failed → tap_ok stays false ⇒ HOLD
+                }
+                // NEVER return/`?`: fall through so the gate + held-status still run.
+            }
+        }
+    }
 
-            match transcode_result {
-                Ok(transcode_video_response) => {
-                    // Handle the successful response
-                    let response = transcode_video_response.into_inner();
+    if enabled {
+        // Dedicated source tap for audio-only OUTPUTS of a video source (nothing to tee
+        // from): its own ffmpeg child is the job's sole video decode.
+        if scan_required && !tapped {
+            match transcode_video::tap_source_keyframes(&file_path, &tap_dir) {
+                Ok(()) => tap_ok = true,
+                Err(e) => eprintln!("Source keyframe tap failed: {:?}", e), // tap_ok stays false ⇒ HOLD
+            }
+        }
+
+        // ONE read of the tap dir; the integrity check AND the POST share this set (no TOCTOU).
+        let kf: Vec<Vec<u8>> = read_keyframe_pngs(&tap_dir);
+        let outcome = if scan_required && (!tap_ok || kf.is_empty()) {
+            // Video source with an absent/partial/empty keyframe set: HOLD, and do NOT POST
+            // (never let the node store a false `Cleared` for unscanned video).
+            moderation::ModerationOutcome::Unavailable
+        } else {
+            // Optional own-hash exact-match input; only computed on the POST path.
+            // Off-reactor: hashing streams the whole (possibly multi-GB) source. Any
+            // failure (JoinError or hash error) ⇒ None — the optional SHA is simply omitted
+            // and the node verdict still governs (fail-closed unchanged).
+            let fp = file_path.clone();
+            let source_sha = tokio::task::spawn_blocking(move || moderation::sha256_file(&fp))
+                .await
+                .ok()
+                .and_then(|r| r.ok());
+            client.moderate(&task_id, &kf, source_sha).await
+        };
+
+        if !moderation::may_publish(&outcome) {
+            // ── HOLD: upload nothing; discard local temp; record held status ──
+            eprintln!("MODERATION HOLD task_id={} outcome={:?}", task_id, outcome);
+            let held_duration = pending.first().map(|o| o.total_duration).unwrap_or(0.0);
+            for out in &pending {
+                if out.is_hls {
+                    let _ = fs::remove_dir_all(transcode_video::hls_output_dir(&out.file_name));
+                } else {
+                    let _ = fs::remove_file(format!(
+                        "{}{}_ue.{}",
+                        *PATH_TO_TRANSCODED_FILE, out.file_name, out.ext
+                    ));
+                }
+            }
+            let _ = fs::remove_dir_all(&tap_dir);
+            let mut transcoded = TRANSCODED.lock().await;
+            transcoded.insert(task_id.clone(), ("[]".to_string(), held_duration));
+            drop(transcoded);
+            for i in 0..formats_count {
+                shared::update_progress(&task_id, i, 100);
+            }
+            return;
+        }
+
+        // ── Cleared: discard the tap, then publish each deferred output ──
+        let _ = fs::remove_dir_all(&tap_dir);
+        for out in pending {
+            let video_format_value = out.video_format.clone();
+            let is_hls = out.is_hls;
+            let dest = out.dest.clone();
+            match transcode_video_publish(out).await {
+                Ok(resp) => {
+                    let response = resp.into_inner();
                     if source_duration == 0.0 && response.duration > 0.0 {
                         source_duration = response.duration;
                     }
-                    println!(
-                        "Response: status_code: {}, message: {}, cid: {}",
-                        response.status_code, response.message, response.cid
-                    );
-
                     if response.status_code != 200 {
                         eprintln!(
-                            "Format {} failed with status {}: {}",
-                            index, response.status_code, response.message
+                            "Publish failed with status {}: {}",
+                            response.status_code, response.message
                         );
                         continue;
                     }
-
-                    // Create a mutable clone of video_format
-                    let mut video_format_modified = video_format.clone();
-
-                    if format.hls.unwrap_or(false) {
-                        if let Ok(hls_result) = serde_json::from_str::<Value>(&response.cid) {
-                            video_format_modified["hls"] = json!(true);
-                            video_format_modified["initSegmentCid"] =
-                                hls_result["init_segment_cid"].clone();
-                            video_format_modified["segments"] = hls_result["segments"].clone();
-                            video_format_modified["previewSegments"] =
-                                hls_result["preview_segments"].clone();
-                            video_format_modified["totalSegments"] =
-                                hls_result["total_segments"].clone();
-                            video_format_modified["totalDuration"] =
-                                hls_result["total_duration"].clone();
-                        }
-                    } else {
-                        match &format.dest {
-                            Some(dest) if dest == "ipfs" => {
-                                video_format_modified["cid"] =
-                                    json!(format!("ipfs://{}", response.cid));
-                            }
-                            _ => {
-                                video_format_modified["cid"] =
-                                    json!(format!("s5://{}", response.cid));
-                            }
-                        }
-                    }
+                    let mut video_format_modified = video_format_value;
+                    apply_cid_metadata(&mut video_format_modified, &response, is_hls, &dest);
                     transcoded_formats.push(video_format_modified);
                 }
                 Err(e) => {
-                    // Log the error and continue with the next format
-                    eprintln!("Error transcoding video: {:?}", e);
+                    eprintln!("Error publishing format: {:?}", e);
                     continue;
                 }
             }
@@ -737,6 +873,59 @@ impl RestHandler {
     }
 }
 
+/// Read the tap dir's keyframe PNGs into memory, sorted by filename. A missing/empty
+/// dir maps to an empty `Vec`; ANY per-file read error also maps to empty (fail-closed —
+/// a partial set must never be scanned as complete). The gate's SINGLE read of the tap:
+/// the integrity check and the POST share this in-memory set (no TOCTOU).
+fn read_keyframe_pngs(tap_dir: &str) -> Vec<Vec<u8>> {
+    let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(tap_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("png"))
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    paths.sort();
+    let mut frames = Vec::with_capacity(paths.len());
+    for p in paths {
+        match std::fs::read(&p) {
+            Ok(bytes) => frames.push(bytes),
+            Err(_) => return Vec::new(), // read error ⇒ empty ⇒ fail-closed HOLD (video source)
+        }
+    }
+    frames
+}
+
+/// Apply the published CID/HLS metadata to a format's catalogue `Value` — the exact
+/// mapping from the original in-loop block, shared by the dark-launch and gated paths
+/// so the dark-launch output stays byte-identical.
+fn apply_cid_metadata(
+    video_format_modified: &mut Value,
+    response: &TranscodeVideoResponse,
+    is_hls: bool,
+    dest: &Option<String>,
+) {
+    if is_hls {
+        if let Ok(hls_result) = serde_json::from_str::<Value>(&response.cid) {
+            video_format_modified["hls"] = json!(true);
+            video_format_modified["initSegmentCid"] = hls_result["init_segment_cid"].clone();
+            video_format_modified["segments"] = hls_result["segments"].clone();
+            video_format_modified["previewSegments"] = hls_result["preview_segments"].clone();
+            video_format_modified["totalSegments"] = hls_result["total_segments"].clone();
+            video_format_modified["totalDuration"] = hls_result["total_duration"].clone();
+        }
+    } else {
+        match dest {
+            Some(d) if d == "ipfs" => {
+                video_format_modified["cid"] = json!(format!("ipfs://{}", response.cid));
+            }
+            _ => {
+                video_format_modified["cid"] = json!(format!("s5://{}", response.cid));
+            }
+        }
+    }
+}
+
 async fn check_transcoded_file_exists(cid: &str, label: &str, ext: &str) -> bool {
     let filename = format!("{}{}_{}.{}", *PATH_TO_TRANSCODED_FILE, cid, label, ext); // Adjust the path and format as needed.
     Path::new(&filename).exists()
@@ -928,6 +1117,83 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Phase 5.3: A4 fail-closed gate tests (stub client, in isolation) ──────────
+    use crate::moderation::{
+        may_publish, ModerationClient, ModerationOutcome, StubModerationClient,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A client that delays then returns a (late) `Unavailable` — models a verdict
+    /// arriving after the timeout window.
+    struct SlowStub;
+    #[async_trait::async_trait]
+    impl ModerationClient for SlowStub {
+        async fn moderate(
+            &self,
+            _t: &str,
+            _k: &[Vec<u8>],
+            _s: Option<String>,
+        ) -> ModerationOutcome {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            ModerationOutcome::Unavailable
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gate_publishes_only_on_cleared() {
+        // The publish seam (an AtomicUsize) runs iff may_publish — exactly once for
+        // Cleared, zero for every other outcome.
+        for (outcome, expect) in [
+            (ModerationOutcome::Cleared, 1usize),
+            (ModerationOutcome::Blocked, 0),
+            (ModerationOutcome::Flagged, 0),
+            (ModerationOutcome::Unavailable, 0),
+        ] {
+            let published = AtomicUsize::new(0);
+            let client = StubModerationClient { outcome };
+            let verdict = client.moderate("task", &[], None).await;
+            if may_publish(&verdict) {
+                published.fetch_add(1, Ordering::SeqCst);
+            }
+            assert_eq!(published.load(Ordering::SeqCst), expect);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_node_down_holds() {
+        // Unavailable models down / timeout / 404 / 4xx / 5xx ⇒ never publish.
+        let client = StubModerationClient {
+            outcome: ModerationOutcome::Unavailable,
+        };
+        let verdict = client.moderate("task", &[], None).await;
+        assert!(!may_publish(&verdict));
+    }
+
+    #[tokio::test]
+    async fn test_slow_verdict_holds() {
+        // We AWAIT the (late) verdict before any publish — never publish-then-block.
+        let published = AtomicUsize::new(0);
+        let verdict = SlowStub.moderate("task", &[], None).await;
+        if may_publish(&verdict) {
+            published.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(published.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_process_single_job_gates_before_publish() {
+        let src = include_str!("server.rs");
+        // needles via concat! so this test's own literals don't self-match
+        let moderate = concat!("client.", "moderate(");
+        let publish = concat!("transcode_video_", "publish(");
+        let guard = concat!("moderation_", "enabled()");
+        let mod_idx = src.find(moderate).expect("gate moderate call present");
+        let pub_idx = src.find(publish).expect("publish call present");
+        assert!(mod_idx < pub_idx, "moderate must run before publish");
+        assert!(src.contains(guard), "gate guarded by moderation_enabled()");
+        assert!(src.contains("may_publish"));
+    }
 
     #[test]
     fn test_proto_get_transcoded_response_has_duration() {
