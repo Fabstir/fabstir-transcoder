@@ -24,6 +24,8 @@ use std::process::{Command, Stdio};
 use tokio::io::AsyncReadExt;
 use tonic::{transport::Server, Code, Request, Response, Status};
 
+// QUARANTINED with the A1 tap path (transitively dead; post-M3 deletion follow-up).
+#[allow(dead_code)]
 static PATH_TO_FILE: Lazy<String> =
     Lazy::new(|| var("PATH_TO_FILE").unwrap_or_else(|_| panic!("PATH_TO_FILE not set in .env")));
 static PATH_TO_TRANSCODED_FILE: Lazy<String> = Lazy::new(|| {
@@ -190,6 +192,8 @@ pub fn hls_output_dir(file_name: &str) -> String {
 const TAP_SCALE: &str = "scale='min(512,iw)':-2";
 
 /// Per-job directory holding the sampled moderation keyframe PNGs.
+/// QUARANTINED (A1 tap superseded by the M3 sidecar, HAND-OFF §6; post-M3 deletion follow-up).
+#[allow(dead_code)]
 pub fn modtap_dir(task_id: &str) -> String {
     format!("{}{}_modtap", *PATH_TO_TRANSCODED_FILE, task_id)
 }
@@ -197,6 +201,8 @@ pub fn modtap_dir(task_id: &str) -> String {
 /// True if the source has at least one video stream. ffprobe-based; on ANY
 /// error/ambiguity returns `true` (fail-closed — a probe false-negative must never
 /// make a video source look audio-only).
+/// QUARANTINED (A1 tap superseded by the M3 sidecar, HAND-OFF §6; post-M3 deletion follow-up).
+#[allow(dead_code)]
 pub fn source_has_video(path: &str) -> bool {
     match Command::new("ffprobe")
         .args([
@@ -226,6 +232,8 @@ pub fn source_has_video(path: &str) -> bool {
 /// all audio (no transcode to tee from): its own ffmpeg child is the job's sole
 /// video decode. Spawn/wait failures AND a non-zero exit ⇒ `Err` (never panic),
 /// so the Phase-5 gate leaves `tap_ok = false` ⇒ HOLD.
+/// QUARANTINED (A1 tap superseded by the M3 sidecar, HAND-OFF §6; post-M3 deletion follow-up).
+#[allow(dead_code)]
 pub fn tap_source_keyframes(file_path: &str, tap_dir: &str) -> Result<(), Status> {
     std::fs::create_dir_all(tap_dir)
         .map_err(|e| Status::new(Code::Internal, format!("modtap dir: {}", e)))?;
@@ -366,10 +374,17 @@ fn run_ffmpeg(
     let do_tap = tap_dir.is_some()
         && vf_foldable(format.vf.as_deref())
         && format.vcodec.as_deref().is_some_and(|v| !v.is_empty());
-    let fps_str = format!(
-        "{:.5}",
-        1.0 / moderation::effective_interval(total_duration)
-    );
+    // Tap-only (A1, quarantined): computed lazily so the sampling env knobs
+    // (MODERATION_SAMPLE_INTERVAL_SECS / _KEYFRAME_MAX) are never read on the
+    // live tap-less path — `transcode_video()` always passes `tap_dir: None`.
+    let fps_str = if do_tap {
+        format!(
+            "{:.5}",
+            1.0 / moderation::effective_interval(total_duration)
+        )
+    } else {
+        String::new()
+    };
     if do_tap {
         // audit line — deterministic, reproducible sample (spec §5)
         println!(

@@ -1,0 +1,114 @@
+# =============================================================================
+# Fabstir Transcoder — M3 moderation sidecar deployment (DRAFT)
+# =============================================================================
+# ⚠️  DO NOT LAUNCH YET: the image digest below is a PLACEHOLDER. The digest
+# currently recorded in the sidecar repo's bundles/v1/manifest.json is the
+# M1–M2 image, which cannot run `python -m fabstir_moderation.service`.
+# [AWAITING JULES: M3 rebuild + digest re-pin] — swap the digest in, then
+# launch. Everything else is per HANDOFF-TRANSCODER-M3.md (§2 topology; §3
+# scoped erratum) + CONTRACT-MODERATION-SERVICE.md.
+#
+# D12 — the one absolute rule: run the pinned image BY DIGEST as a sidecar.
+# Never a mutable tag. Never `pip install` / copy the moderation code into the
+# transcoder image. NEVER mount anything over /work in the sidecar — its
+# install is editable, so a /work mount silently replaces the frozen
+# digest-pinned code with whatever is on the host, invisible to every test.
+#
+# UID/permissions recipe (HAND-OFF §2 — the code trusts the socket; deployment
+# makes that trust true): BOTH containers run as the same non-root UID:GID
+# (1000:1000); socket dir + source dir owned by that UID:GID, mode 0770; no
+# volume on a world-accessible host path. A socket-permission mismatch fails
+# as connect-refused on the TRANSCODER side (never an error.kind), so alert on
+# prolonged absence of moderation traffic, not only on error kinds.
+#
+# Readiness (HAND-OFF §2/§7): expect MINUTES of model load before the socket
+# appears (one-time per daemon start). Poll every 5 s with a 10-minute budget:
+#   docker compose exec moderation \
+#     curl --unix-socket /run/moderation/mod.sock http://localhost/v1/health
+# The socket file existing is NOT readiness. Shadow-mode kill grace: 120 s —
+# and confirm the old process has actually EXITED (not merely that the grace
+# elapsed) before starting a replacement, or the GPU overlap CONTRACT §5
+# forbids recurs. If MODERATION_ENABLED stays false for long stretches, stop
+# this sidecar entirely: it keeps ~6 GB VRAM resident even idle — budget that
+# alongside the transcoder's NVENC use when placing it.
+#
+# HF_TOKEN bootstrap (first-ever run on a host with an empty model cache; the
+# judge weights are gated) [AWAITING JULES: OQ-M3-6 for the durable answer]:
+#   1. put HF_TOKEN=... in a gitignored .env.local
+#   2. docker compose --env-file .env.local -f docker-compose.moderation.yml \
+#        up moderation   # add "- HF_TOKEN=${HF_TOKEN}" to environment for this
+#   3. once GET /v1/health is green and hf-cache is warm, restart WITHOUT the
+#      token. The cache (~9 GB disk) persists in the hf-cache volume.
+#
+# moderation-sources sizing (disk-headroom guidance — the §3 scoped erratum
+# dropped the tmpfs/RAM mandate; plan Q3): it must hold
+#   MAX_CONCURRENT_TRANSCODES × (~2× largest source)
+# (encrypted download + decrypted source coexist transiently per job), with
+# sources pinned for up to the worst-case moderation queue (hours).
+
+services:
+  transcoder:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    user: "1000:1000"
+    environment:
+      - MODERATION_ENABLED=${MODERATION_ENABLED:-false} # invocation-only (D1); never blocks
+      - MODERATION_SOCKET_PATH=/run/moderation/mod.sock
+      - MODERATION_SIDECAR_SOURCE_ROOT=/sources
+      # PATH_TO_FILE's directory must be EXACTLY the volume mount point (e.g.
+      # PATH_TO_FILE=/app/cache/sources/ — an optional filename prefix is fine,
+      # a DEEPER subdirectory is not): path translation is flat
+      # (/sources/<file name>), so /app/cache/sources/vids/ would make every
+      # job fail open as SOURCE_NOT_FOUND while looking "on" (HAND-OFF §5.2).
+    # env_file: ../transcode_server/.env   # the usual runtime config
+    volumes:
+      - moderation-sock:/run/moderation
+      # rw here, ro in the sidecar — and it MUST be the SAME named volume in
+      # both containers: a container-private mount hands the sidecar an EMPTY
+      # /sources and every job fails open as SOURCE_NOT_FOUND while looking "on".
+      - moderation-sources:/app/cache/sources
+    ports:
+      - "50051:50051"
+      - "8000:8000"
+    # NVENC needs the GPU too — budget the sidecar's ~6 GB resident VRAM
+    # alongside the transcoder's encoder sessions when placing both on one card.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  moderation:
+    # PLACEHOLDER — replace with the re-pinned M3 digest from the sidecar
+    # repo's bundles/v1/manifest.json before first launch (D12: by digest only).
+    image: fabstir-moderation-runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    command: python -m fabstir_moderation.service
+    user: "1000:1000"
+    environment:
+      - MODERATION_SOCKET=/run/moderation/mod.sock
+      - MODERATION_SOURCE_ROOT=/sources
+      - MODERATION_SINK_PATH=/shadow/shadow.jsonl
+      - HF_HOME=/models
+      # - HF_TOKEN=${HF_TOKEN}   # one-time cache bootstrap ONLY — see header
+    volumes:
+      - moderation-sock:/run/moderation
+      - moderation-sources:/sources:ro
+      - moderation-shadow:/shadow
+      - hf-cache:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stop_grace_period: 120s
+
+volumes:
+  moderation-sock:
+  moderation-sources: # ordinary shared named volume (HAND-OFF §3 scoped erratum — no tmpfs)
+  moderation-shadow: # durable: JSONL shadow evidence (CONTRACT §8), one line per successful job
+  hf-cache: # ~9 GB of model weights, downloaded once per host

@@ -100,8 +100,14 @@ mod tests {
         assert_eq!(*MAX_CONCURRENT, 3);
     }
 
+    /// Both counter tests mutate the same process-global atomics; the parallel
+    /// test runner can interleave them (one test's `store(0)` landing between
+    /// the other's increment and assert) — serialise them on a shared lock.
+    static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_active_jobs_counter() {
+        let _serial = COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ACTIVE_JOBS.store(0, Ordering::Relaxed);
         QUEUED_JOBS.store(0, Ordering::Relaxed);
 
@@ -119,6 +125,7 @@ mod tests {
 
     #[test]
     fn test_queued_jobs_counter() {
+        let _serial = COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ACTIVE_JOBS.store(0, Ordering::Relaxed);
         QUEUED_JOBS.store(0, Ordering::Relaxed);
 

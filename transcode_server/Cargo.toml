@@ -43,10 +43,12 @@ warp = "0.3.1"
 jsonwebtoken = "8.1"
 serde = "1.0.171"
 serde_derive = "1.0.171"
-serde_json = "1.0.102"
+serde_json = { version = "1.0.102", features = ["raw_value"] }
 prost-types = "0.11.9"
 prost-derive = "0.11.9"
-hyper = "0.14.4"
+# M3 sidecar client: explicit client+http1 (do not rely on tonic's transitive
+# feature unification); floor = the tested lockfile version.
+hyper = { version = "0.14.30", features = ["client", "http1"] }
 uuid = { version = "1.4.1", features = ["v4"] }
 chrono = "0.4.19"
 regex = "1.5.4"

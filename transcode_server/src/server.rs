@@ -20,10 +20,7 @@ mod utils;
 use utils::{base64url_to_bytes, bytes_to_base64url, download_and_concat_files, download_video};
 
 mod transcode_video;
-use transcode_video::{
-    get_video_format_from_str, transcode_video, transcode_video_produce, transcode_video_publish,
-    LocalOutput, TranscodeVideoResponse,
-};
+use transcode_video::{get_video_format_from_str, transcode_video, TranscodeVideoResponse};
 
 mod hls_segment;
 mod moderation;
@@ -320,9 +317,10 @@ async fn process_single_job(
             println!("key_bytes: {:?}", key_bytes);
             println!("last_index_size: {}", last_index_size);
 
+            let part_path = format!("{}.part", file_path);
             match decrypt_file_xchacha20(
                 file_path_encrypted,
-                file_path.clone(),
+                part_path.clone(),
                 key_bytes,
                 0,
                 last_index_size,
@@ -333,29 +331,43 @@ async fn process_single_job(
                     return;
                 }
             }
+            if let Err(e) = finalize_part(&part_path, &file_path) {
+                eprintln!("Source finalise error: {:?}", e);
+                return;
+            }
         } else {
             match storage_network.as_deref() {
                 Some("ipfs") => {
                     let url = format!("{}{}{}", *IPFS_GATEWAY, "/ipfs/", source_cid);
 
-                    match download_video(&url, file_path.as_str()).await {
+                    let part_path = format!("{}.part", file_path);
+                    match download_video(&url, part_path.as_str()).await {
                         Ok(_) => println!("Video downloaded successfully from URL: {}", url),
                         Err(e) => {
                             eprintln!("Failed to download video from URL {}: {}", &url, e);
                             return;
                         }
                     };
+                    if let Err(e) = finalize_part(&part_path, &file_path) {
+                        eprintln!("Source finalise error: {:?}", e);
+                        return;
+                    }
                 }
                 _ => {
                     let url = format!("{}{}{}", portal_url, "/s5/blob/", source_cid);
 
-                    match download_video(&url, file_path.as_str()).await {
+                    let part_path = format!("{}.part", file_path);
+                    match download_video(&url, part_path.as_str()).await {
                         Ok(_) => println!("Video downloaded successfully from URL: {}", url),
                         Err(e) => {
                             eprintln!("Failed to download video from URL {}: {}", &url, e);
                             return;
                         }
                     };
+                    if let Err(e) = finalize_part(&part_path, &file_path) {
+                        eprintln!("Source finalise error: {:?}", e);
+                        return;
+                    }
                 }
             }
         }
@@ -385,22 +397,12 @@ async fn process_single_job(
     let mut transcoded_formats = Vec::new();
     let mut source_duration: f64 = 0.0;
 
-    // ── A4 content-moderation gate (dark behind MODERATION_ENABLED; default off) ──
-    let enabled = moderation::moderation_enabled();
-    let client = moderation::default_client();
-    let tap_dir = transcode_video::modtap_dir(&task_id);
-    // Probe the SOURCE (now on disk), not output codecs; `&&` short-circuits so a
-    // disabled run never spawns ffprobe. On probe error, source_has_video ⇒ true ⇒ HOLD.
-    let scan_required = enabled && transcode_video::source_has_video(&file_path);
-    if enabled {
-        // Defense-in-depth: clear any stale tap dir before producing this job's keyframes
-        // so the gate can never read a prior run's PNGs. (task_id is a fresh UUID, so this
-        // is belt-and-braces.) Dark-launch parity: guarded by `enabled`.
-        let _ = fs::remove_dir_all(&tap_dir);
+    // ── M3 shadow moderation (D1/D4): fire-and-forget, concurrent with the
+    //    transcode loop below; incapable of delaying, failing, or blocking
+    //    this job. The source (fresh or cache-hit) is final on disk here. ──
+    if moderation::moderation_enabled() {
+        spawn_shadow_moderation(task_id.clone(), file_path.clone());
     }
-    let mut pending: Vec<LocalOutput> = Vec::new();
-    let mut tap_ok = !scan_required; // audio source: nothing to tap, empty set is clearable
-    let mut tapped = false; // has the tap been assigned to a video output yet?
 
     for (index, video_format) in media_formats_vec.iter().enumerate() {
         let video_format_str = match serde_json::to_string(&video_format) {
@@ -420,8 +422,8 @@ async fn process_single_job(
             }
         };
 
-        if !enabled {
-            // ── Dark-launch: legacy inline produce+publish, byte-identical to today ──
+        {
+            // ── The single transcode path (M3: shadow moderation never alters this flow) ──
             if !check_transcoded_file_exists(
                 file_path.as_str(),
                 &format.id.to_string(),
@@ -473,145 +475,6 @@ async fn process_single_job(
                     }
                 }
             }
-            continue;
-        }
-
-        // ── Enabled: produce-only; publish is deferred until a `cleared` verdict ──
-        let fmt_has_video = video_format["vcodec"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty());
-        // The tap owner must ALSO have a foldable vf — a non-foldable-vf format emits no
-        // PNGs (run_ffmpeg's do_tap), so letting it claim the tap would permanently HOLD the
-        // job; instead a later foldable format or the source-tap fallback handles it.
-        let want_tap =
-            fmt_has_video && transcode_video::vf_foldable(video_format["vf"].as_str()) && !tapped;
-        // Cache short-circuit applies to non-tap formats only; the tap owner always
-        // re-emits a fresh keyframe set (never moderate a stale/empty cached dir).
-        if !want_tap
-            && check_transcoded_file_exists(
-                file_path.as_str(),
-                &format.id.to_string(),
-                format.ext.as_str(),
-            )
-            .await
-        {
-            continue;
-        }
-        let this_tap = if want_tap {
-            Some(tap_dir.as_str())
-        } else {
-            None
-        };
-        match transcode_video_produce(
-            task_id.clone(),
-            index,
-            &file_path,
-            &video_format_str,
-            is_encrypted,
-            is_gpu,
-            preview_percent,
-            this_tap,
-        )
-        .await
-        {
-            Ok(out) => {
-                if want_tap {
-                    tapped = true;
-                    tap_ok = true; // the tap-owning ffmpeg run succeeded
-                }
-                pending.push(out);
-            }
-            Err(e) => {
-                eprintln!("Error producing format {}: {:?}", index, e);
-                if want_tap {
-                    tapped = true; // tap owner attempted+failed → tap_ok stays false ⇒ HOLD
-                }
-                // NEVER return/`?`: fall through so the gate + held-status still run.
-            }
-        }
-    }
-
-    if enabled {
-        // Dedicated source tap for audio-only OUTPUTS of a video source (nothing to tee
-        // from): its own ffmpeg child is the job's sole video decode.
-        if scan_required && !tapped {
-            match transcode_video::tap_source_keyframes(&file_path, &tap_dir) {
-                Ok(()) => tap_ok = true,
-                Err(e) => eprintln!("Source keyframe tap failed: {:?}", e), // tap_ok stays false ⇒ HOLD
-            }
-        }
-
-        // ONE read of the tap dir; the integrity check AND the POST share this set (no TOCTOU).
-        let kf: Vec<Vec<u8>> = read_keyframe_pngs(&tap_dir);
-        let outcome = if scan_required && (!tap_ok || kf.is_empty()) {
-            // Video source with an absent/partial/empty keyframe set: HOLD, and do NOT POST
-            // (never let the node store a false `Cleared` for unscanned video).
-            moderation::ModerationOutcome::Unavailable
-        } else {
-            // Optional own-hash exact-match input; only computed on the POST path.
-            // Off-reactor: hashing streams the whole (possibly multi-GB) source. Any
-            // failure (JoinError or hash error) ⇒ None — the optional SHA is simply omitted
-            // and the node verdict still governs (fail-closed unchanged).
-            let fp = file_path.clone();
-            let source_sha = tokio::task::spawn_blocking(move || moderation::sha256_file(&fp))
-                .await
-                .ok()
-                .and_then(|r| r.ok());
-            client.moderate(&task_id, &kf, source_sha).await
-        };
-
-        if !moderation::may_publish(&outcome) {
-            // ── HOLD: upload nothing; discard local temp; record held status ──
-            eprintln!("MODERATION HOLD task_id={} outcome={:?}", task_id, outcome);
-            let held_duration = pending.first().map(|o| o.total_duration).unwrap_or(0.0);
-            for out in &pending {
-                if out.is_hls {
-                    let _ = fs::remove_dir_all(transcode_video::hls_output_dir(&out.file_name));
-                } else {
-                    let _ = fs::remove_file(format!(
-                        "{}{}_ue.{}",
-                        *PATH_TO_TRANSCODED_FILE, out.file_name, out.ext
-                    ));
-                }
-            }
-            let _ = fs::remove_dir_all(&tap_dir);
-            let mut transcoded = TRANSCODED.lock().await;
-            transcoded.insert(task_id.clone(), ("[]".to_string(), held_duration));
-            drop(transcoded);
-            for i in 0..formats_count {
-                shared::update_progress(&task_id, i, 100);
-            }
-            return;
-        }
-
-        // ── Cleared: discard the tap, then publish each deferred output ──
-        let _ = fs::remove_dir_all(&tap_dir);
-        for out in pending {
-            let video_format_value = out.video_format.clone();
-            let is_hls = out.is_hls;
-            let dest = out.dest.clone();
-            match transcode_video_publish(out).await {
-                Ok(resp) => {
-                    let response = resp.into_inner();
-                    if source_duration == 0.0 && response.duration > 0.0 {
-                        source_duration = response.duration;
-                    }
-                    if response.status_code != 200 {
-                        eprintln!(
-                            "Publish failed with status {}: {}",
-                            response.status_code, response.message
-                        );
-                        continue;
-                    }
-                    let mut video_format_modified = video_format_value;
-                    apply_cid_metadata(&mut video_format_modified, &response, is_hls, &dest);
-                    transcoded_formats.push(video_format_modified);
-                }
-                Err(e) => {
-                    eprintln!("Error publishing format: {:?}", e);
-                    continue;
-                }
-            }
         }
     }
 
@@ -627,6 +490,77 @@ async fn process_single_job(
     for i in 0..formats_count {
         shared::update_progress(&task_id, i, 100);
     }
+}
+
+/// M3 shadow moderation (HAND-OFF §5): pin the source against GC, translate
+/// its path to the sidecar's view, call the sidecar (one in flight per
+/// process; per-call deadline), log the outcome, relay a verdict via the
+/// (stubbed, OQ-M3-1) relay. Detached — the job never awaits it (D4:
+/// incapable of delaying, failing, or blocking a transcode).
+fn spawn_shadow_moderation(task_id: String, file_path: String) {
+    // Admission control first (D1 indirect-coupling guard): each pending
+    // shadow call pins a multi-GB source, so at the cap we shed — fail open —
+    // rather than let a wedged sidecar grow the pin set until the cache
+    // volume fills and NEW jobs' downloads start failing.
+    let pending = match moderation::try_shadow_slot() {
+        Some(guard) => guard,
+        None => {
+            eprintln!(
+                "MODERATION SHADOW task_id={} ALERT shed: shadow queue at capacity \
+                 (MODERATION_MAX_PENDING) — sidecar wedged or undersized? — failing open",
+                task_id
+            );
+            return;
+        }
+    };
+    // Pin BEFORE spawning and move the guard into the task: between spawn and
+    // the task's first poll the source would otherwise be unprotected — and
+    // GC deletes newest-first, which is exactly this file. RAII: released on
+    // every exit path, panic included (CONTRACT §3: the source must survive
+    // until the response arrives).
+    let pin = moderation::pin(&file_path);
+    tokio::spawn(async move {
+        let _pending = pending;
+        let _pin = pin;
+        let socket = match moderation::socket_path() {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "MODERATION SHADOW task_id={} ALERT config-fault: MODERATION_ENABLED=true \
+                     but MODERATION_SOCKET_PATH unset — failing open",
+                    task_id
+                );
+                return;
+            }
+        };
+        let sidecar_path = match moderation::sidecar_source_path(&file_path) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "MODERATION SHADOW task_id={} ALERT config-fault: untranslatable source \
+                     path {} — failing open",
+                    task_id, file_path
+                );
+                return;
+            }
+        };
+        let (outcome, wait_ms, call_ms) =
+            moderation::moderate_via_sidecar(&socket, &sidecar_path).await;
+        // One structured line per job (HAND-OFF §8) — on a verdict, call_ms is
+        // the owed CONTRACT §6 budget number; wait_ms is queue diagnostics.
+        println!(
+            "MODERATION SHADOW task_id={} wait_ms={} call_ms={} {}",
+            task_id,
+            wait_ms,
+            call_ms,
+            moderation::outcome_log_fragment(&outcome)
+        );
+        if let Some(envelope) = moderation::build_relay_envelope(&task_id, &outcome) {
+            if let Err(e) = moderation::default_relay().relay(&task_id, &envelope).await {
+                eprintln!("MODERATION SHADOW task_id={} relay error: {:?}", task_id, e);
+            }
+        }
+    });
 }
 
 async fn transcode_task_receiver(receiver: Arc<Mutex<mpsc::Receiver<TranscodeJob>>>) {
@@ -873,10 +807,13 @@ impl RestHandler {
     }
 }
 
+/// ── QUARANTINED (A1/A3/A4 — retired per Q1(a); deletion is a scheduled
+/// post-M3 follow-up, see IMPLEMENTATION-MODERATION-SIDECAR-M3.md) ──
 /// Read the tap dir's keyframe PNGs into memory, sorted by filename. A missing/empty
 /// dir maps to an empty `Vec`; ANY per-file read error also maps to empty (fail-closed —
 /// a partial set must never be scanned as complete). The gate's SINGLE read of the tap:
 /// the integrity check and the POST share this in-memory set (no TOCTOU).
+#[allow(dead_code)]
 fn read_keyframe_pngs(tap_dir: &str) -> Vec<Vec<u8>> {
     let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(tap_dir) {
         Ok(rd) => rd
@@ -942,11 +879,27 @@ fn dir_size(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Finalise a freshly written source (HAND-OFF §5.1): fsync the `.part` file,
+/// then atomically rename it into place — the moderation sidecar stat-checks
+/// and refuses to report on a file that changes mid-run (`SOURCE_MUTATED`).
+/// The parent-directory fsync is deliberately omitted: a crash before the
+/// dirent persists only costs a re-download of re-derivable data.
+fn finalize_part(part: &str, final_path: &str) -> std::io::Result<()> {
+    fs::File::open(part)?.sync_all()?;
+    fs::rename(part, final_path)
+}
+
 fn garbage_collect(directory: &str, size_threshold: u64) {
     let mut files: Vec<_> = fs::read_dir(directory)
         .unwrap()
         .filter_map(|entry| {
             entry.ok().and_then(|e| {
+                // M3: sources with an in-flight shadow moderation call are
+                // pinned — CONTRACT §3 requires them undisturbed until the
+                // sidecar's response arrives (worst case hours).
+                if moderation::is_pinned(&e.path()) {
+                    return None;
+                }
                 let meta = e.metadata().ok()?;
                 let size = if meta.is_dir() {
                     dir_size(&e.path())
@@ -965,6 +918,13 @@ fn garbage_collect(directory: &str, size_threshold: u64) {
 
     while total_size > size_threshold && !files.is_empty() {
         if let Some((path, size, _, is_dir)) = files.pop() {
+            // Re-check at DELETE time: a pin can land after the snapshot
+            // above (a job cache-hits this source mid-GC-pass), and the
+            // snapshot-time filter alone would still delete it (review
+            // round 2, finding 1).
+            if moderation::is_pinned(&path) {
+                continue;
+            }
             if is_dir {
                 fs::remove_dir_all(&path).ok();
             } else {
@@ -1118,81 +1078,146 @@ async fn main() {
 mod tests {
     use super::*;
 
-    // ── Phase 5.3: A4 fail-closed gate tests (stub client, in isolation) ──────────
-    use crate::moderation::{
-        may_publish, ModerationClient, ModerationOutcome, StubModerationClient,
-    };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    // ── M3 — Phase 5.3: shadow-wiring structural tests ────────────────────
+    // (The pre-M3 A4 gate tests that asserted moderate-before-publish and the
+    // publish-predicate wiring were removed with the gate itself — Q1(a): retired.)
 
-    /// A client that delays then returns a (late) `Unavailable` — models a verdict
-    /// arriving after the timeout window.
-    struct SlowStub;
-    #[async_trait::async_trait]
-    impl ModerationClient for SlowStub {
-        async fn moderate(
-            &self,
-            _t: &str,
-            _k: &[Vec<u8>],
-            _s: Option<String>,
-        ) -> ModerationOutcome {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            ModerationOutcome::Unavailable
-        }
-    }
-
-    #[tokio::test]
-    async fn test_gate_publishes_only_on_cleared() {
-        // The publish seam (an AtomicUsize) runs iff may_publish — exactly once for
-        // Cleared, zero for every other outcome.
-        for (outcome, expect) in [
-            (ModerationOutcome::Cleared, 1usize),
-            (ModerationOutcome::Blocked, 0),
-            (ModerationOutcome::Flagged, 0),
-            (ModerationOutcome::Unavailable, 0),
-        ] {
-            let published = AtomicUsize::new(0);
-            let client = StubModerationClient { outcome };
-            let verdict = client.moderate("task", &[], None).await;
-            if may_publish(&verdict) {
-                published.fetch_add(1, Ordering::SeqCst);
-            }
-            assert_eq!(published.load(Ordering::SeqCst), expect);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_node_down_holds() {
-        // Unavailable models down / timeout / 404 / 4xx / 5xx ⇒ never publish.
-        let client = StubModerationClient {
-            outcome: ModerationOutcome::Unavailable,
-        };
-        let verdict = client.moderate("task", &[], None).await;
-        assert!(!may_publish(&verdict));
-    }
-
-    #[tokio::test]
-    async fn test_slow_verdict_holds() {
-        // We AWAIT the (late) verdict before any publish — never publish-then-block.
-        let published = AtomicUsize::new(0);
-        let verdict = SlowStub.moderate("task", &[], None).await;
-        if may_publish(&verdict) {
-            published.fetch_add(1, Ordering::SeqCst);
-        }
-        assert_eq!(published.load(Ordering::SeqCst), 0);
+    #[test]
+    fn test_garbage_collect_spares_pinned_file() {
+        // Behavioral (not just structural): a pinned source survives a GC
+        // pass that collects everything else — this catches any mismatch
+        // between the pin registry's path strings and read_dir's entries.
+        let dir = std::env::temp_dir().join("m3_gc_pin_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pinned = dir.join("pinned_source");
+        let victim = dir.join("unpinned_source");
+        std::fs::write(&pinned, [0u8; 64]).unwrap();
+        std::fs::write(&victim, [0u8; 64]).unwrap();
+        let guard = crate::moderation::pin(pinned.to_str().unwrap());
+        garbage_collect(dir.to_str().unwrap(), 0); // threshold 0: delete all it can
+        assert!(pinned.exists(), "pinned source must survive GC");
+        assert!(!victim.exists(), "unpinned file must be collected");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_process_single_job_gates_before_publish() {
+    fn test_shadow_moderation_is_fail_open() {
         let src = include_str!("server.rs");
         // needles via concat! so this test's own literals don't self-match
-        let moderate = concat!("client.", "moderate(");
-        let publish = concat!("transcode_video_", "publish(");
+        let may = concat!("may_", "publish");
+        let hold = concat!("MODERATION", " HOLD");
+        let produce = concat!("transcode_video_", "produce(");
+        // D1/D4: no publish gate, no hold — job flow independent of moderation
+        assert!(!src.contains(may), "no publish gate in the live job flow");
+        assert!(!src.contains(hold), "no hold path");
+        // A1 tap superseded (HAND-OFF §6): the produce/tap path is unreachable
+        assert!(
+            !src.contains(produce),
+            "produce/tap path gone from job flow"
+        );
+        // the shadow task is spawned, guarded only by the invocation switch
+        let spawn = concat!("spawn_shadow_", "moderation(");
         let guard = concat!("moderation_", "enabled()");
-        let mod_idx = src.find(moderate).expect("gate moderate call present");
-        let pub_idx = src.find(publish).expect("publish call present");
-        assert!(mod_idx < pub_idx, "moderate must run before publish");
-        assert!(src.contains(guard), "gate guarded by moderation_enabled()");
-        assert!(src.contains("may_publish"));
+        assert!(src.contains(spawn), "shadow task spawned");
+        assert!(src.contains(guard), "guarded by the invocation switch");
+    }
+
+    #[test]
+    fn test_shadow_task_pins_logs_and_relays() {
+        let src = include_str!("server.rs");
+        let f_start = src
+            .find("fn spawn_shadow_moderation")
+            .expect("shadow task fn present");
+        // slice to the next top-level item — find() ends are always char-safe
+        // (a fixed byte length can land mid-UTF-8 and panic)
+        let body = &src[f_start..];
+        let body = &body[..body.find("\nasync fn ").unwrap_or(body.len())];
+        assert!(
+            body.contains("moderation::pin("),
+            "source pinned for the shadow window (RAII)"
+        );
+        assert!(body.contains("MODERATION SHADOW"), "structured log line");
+        assert!(
+            body.contains("wait_ms") && body.contains("call_ms"),
+            "wait/call clocks logged separately (call_ms = CONTRACT §6 number)"
+        );
+        assert!(body.contains("build_relay_envelope"), "verdicts relayed");
+    }
+
+    #[test]
+    fn test_gc_is_sole_source_deletion_path() {
+        // Source-lifetime invariant (plan: review issue 3): outside
+        // garbage_collect, no deletion may touch a source path — the pin
+        // registry is only sound because GC is the sole deletion path.
+        let src = include_str!("server.rs");
+        let del_file = concat!("remove_", "file");
+        let del_dir = concat!("remove_dir", "_all");
+        let src_var = concat!("file_", "path");
+        let src_root = concat!("PATH_TO_", "FILE");
+        let gc_start = src.find("fn garbage_collect").expect("gc fn");
+        let gc_len = src[gc_start..].find("\n}").expect("gc end") + 2;
+        let mut offset = 0usize;
+        for line in src.lines() {
+            let in_gc = offset >= gc_start && offset < gc_start + gc_len;
+            if !in_gc && (line.contains(del_file) || line.contains(del_dir)) {
+                assert!(
+                    !line.contains(src_var) && !line.contains(src_root),
+                    "non-GC deletion touching a source path: {}",
+                    line
+                );
+            }
+            offset += line.len() + 1;
+        }
+    }
+
+    // ── M3 — Phase 4.2: source finalisation ───────────────────────────────
+
+    #[test]
+    fn test_finalize_part_renames_into_place() {
+        let dir = std::env::temp_dir();
+        let part = dir.join("m3_finalize_test.mp4.part");
+        let final_path = dir.join("m3_finalize_test.mp4");
+        let _ = std::fs::remove_file(&final_path);
+        std::fs::write(&part, b"source bytes").unwrap();
+        finalize_part(part.to_str().unwrap(), final_path.to_str().unwrap()).unwrap();
+        assert!(!part.exists(), ".part must be gone after finalise");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"source bytes");
+        let _ = std::fs::remove_file(&final_path);
+        // missing .part ⇒ Err, never panic
+        assert!(finalize_part("/nonexistent.part", "/nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_sources_are_finalized_before_use() {
+        let src = include_str!("server.rs");
+        // both source-producing branches write to .part and finalise
+        let needle = concat!("finalize", "_part(");
+        assert!(
+            src.matches(needle).count() >= 3, // decrypt + 2 download sites (+ this test)
+            "decrypt/download destinations must go through finalize_part"
+        );
+        assert!(src.contains(".part\", file_path)") || src.contains("part_path"));
+    }
+
+    // ── M3 — Phase 4.1: GC pin wiring ─────────────────────────────────────
+
+    #[test]
+    fn test_garbage_collect_skips_pinned_sources() {
+        let src = include_str!("server.rs");
+        let gc_start = src
+            .find("fn garbage_collect")
+            .expect("garbage_collect present");
+        // slice to the fn's closing brace — find() ends are always char-safe
+        // (a fixed byte length can land mid-UTF-8 and panic)
+        let gc_body = &src[gc_start..];
+        let gc_body = &gc_body[..gc_body.find("\n}").map(|i| i + 2).unwrap_or(gc_body.len())];
+        assert!(
+            gc_body.matches("moderation::is_pinned").count() >= 2,
+            "garbage_collect must consult the pin registry BOTH at snapshot \
+             time and again at delete time (a pin can land mid-pass)"
+        );
     }
 
     #[test]
