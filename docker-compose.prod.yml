@@ -47,6 +47,38 @@ services:
       FABSTIR_TRANSCODER_JWT: ${FABSTIR_TRANSCODER_JWT:?Required}            # JWT token for API authentication
       FABSTIR_TRANSCODER_SECRET_KEY: ${FABSTIR_TRANSCODER_SECRET_KEY:?Required}  # Secret key for JWT verification
 
+      # -- Content-moderation publish gate (WP-T) --
+      # Unset/`off` = today's behaviour exactly: no keyframe tap, no POST, no
+      # gate. Deploying this image with the gate off is a no-op for transcodes,
+      # so the image can land ahead of flipping dark.
+      #
+      # Ladder: off -> dark (tap + POST + verdict recorded, publishes anyway)
+      #            -> enforce (publish only on a `cleared` verdict).
+      # An unrecognised value is BOOT-FATAL: the container exits(1) naming the
+      # bad value, before either listener binds, so a typo is a crash-loop at
+      # deploy time rather than a silently disarmed gate.
+      MODERATION_GATE: ${MODERATION_GATE:-off}
+
+      # Node base URL for POST /v1/moderate/frames. Required once armed.
+      MODERATION_NODE_URL: ${MODERATION_NODE_URL:-}
+
+      # Shared secret, sent as the `ingestToken` BODY field (never a header).
+      # Must match the node's value exactly. Unset while armed => the node 401s
+      # every call => every job holds, with one named ALERT per job.
+      MODERATION_INGEST_TOKEN: ${MODERATION_INGEST_TOKEN:-}
+
+      # Optional knobs — defaults are the agreed Q7 numbers; leave unset unless
+      # there is a measured reason. Sampling floor 2s, cap 12s, budget 1000
+      # keyframes; frames POST deadline 30s PER BATCH (the sample is split into
+      # batches of <=200 to stay under the node's 20MB body cap).
+      # MODERATION_FRAMES_TIMEOUT_SECS: 30
+      # MODERATION_SAMPLE_INTERVAL_SECS: 2.0
+      # MODERATION_MAX_INTERVAL_SECS: 12.0
+      # MODERATION_KEYFRAME_MAX: 1000
+
+      # NOT the same switch: MODERATION_ENABLED is the M3 shadow-sidecar
+      # invocation flag and needs that sidecar deployed. Leave it unset here.
+
       # -- GPU (optional) --
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,video}
 
