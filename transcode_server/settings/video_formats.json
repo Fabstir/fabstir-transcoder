@@ -20,7 +20,7 @@
     "ext": "mp4",
     "vcodec": "av1_nvenc",
     "preset": "slower",
-    "profile": "high",
+    "profile": "main",
     "ch": 2,
     "vf": "scale=3840x2160",
     "b_v": "12M",

@@ -106,6 +106,33 @@ fn add_arg(cmd: &mut Command, arg: &str, value: Option<&str>) {
     }
 }
 
+/// True for any NVENC encoder (`h264_nvenc`, `hevc_nvenc`, `av1_nvenc`, ...).
+fn is_nvenc(vcodec: &str) -> bool {
+    vcodec.ends_with("_nvenc")
+}
+
+/// Emit `-c:v <vcodec>`, plus `-bf 0` on NVENC.
+///
+/// **Host workaround, not a preference (2026-07-31).** On the L40S production
+/// host every NVENC encode — h264, hevc and av1 alike, across drivers 580 and
+/// 610, four FFmpeg builds, inside and outside Docker — fails with
+/// "Failed locking bitstream buffer: invalid param (8)" as soon as B-frame
+/// reordered output engages. The failure point moves with resolution, which
+/// makes it masquerade as a resolution limit. Disabling B-frames fixes it
+/// completely (clean 600-frame runs at 720p and 1080p).
+///
+/// Cost is a few percent of bitrate efficiency and nothing else. The
+/// underlying platform issue (likely the hypervisor's handling of the
+/// reordered-output path) is being chased separately; **lift this once that
+/// lands** — it is deliberately one function so there is a single place to
+/// remove, rather than two drifting call sites.
+fn add_video_codec(cmd: &mut Command, vcodec: &str) {
+    add_arg(cmd, "-c:v", Some(vcodec));
+    if is_nvenc(vcodec) {
+        cmd.args(["-bf", "0"]);
+    }
+}
+
 pub fn get_video_format_from_str(video_format: &str) -> Result<VideoFormat, Status> {
     serde_json::from_str::<VideoFormat>(video_format).map_err(|err| {
         Status::new(
@@ -408,7 +435,7 @@ fn run_ffmpeg(
             add_arg(&mut cmd, "-i", Some(file_path));
         }
         if let Some(vcodec) = format.vcodec.as_deref() {
-            add_arg(&mut cmd, "-c:v", Some(vcodec));
+            add_video_codec(&mut cmd, vcodec);
         }
         if let Some(b_v) = format.b_v.as_deref() {
             add_arg(&mut cmd, "-b:v", Some(b_v));
@@ -425,7 +452,9 @@ fn run_ffmpeg(
         if let Some(ar) = format.ar.as_deref() {
             add_arg(&mut cmd, "-ar", Some(ar));
         }
-        if tap_dir.is_none() {
+        // See the CPU-path note below: gate on `do_tap`, not `tap_dir`, or a
+        // non-foldable-vf format silently loses its scaling.
+        if !do_tap {
             if let Some(vf) = format.vf.as_deref() {
                 add_arg(&mut cmd, "-vf", Some(vf));
             }
@@ -504,7 +533,7 @@ fn run_ffmpeg(
                     add_arg(&mut cmd, "-i", Some(file_path));
                 }
                 if let Some(vcodec) = format.vcodec.as_deref() {
-                    add_arg(&mut cmd, "-c:v", Some(vcodec));
+                    add_video_codec(&mut cmd, vcodec);
                 }
                 if let Some(b_v) = format.b_v.as_deref() {
                     add_arg(&mut cmd, "-b:v", Some(b_v));
@@ -521,7 +550,13 @@ fn run_ffmpeg(
                 if let Some(ar) = format.ar.as_deref() {
                     add_arg(&mut cmd, "-ar", Some(ar));
                 }
-                if tap_dir.is_none() {
+                // Suppress `-vf` ONLY when the tap actually folds it into the
+                // filtergraph. Keying this on `tap_dir.is_none()` was wrong:
+                // `do_tap` additionally requires a foldable vf and a video
+                // codec, so a format handed a tap_dir but rejected by either
+                // check lost its `-vf` entirely and silently produced an
+                // unscaled rendition.
+                if !do_tap {
                     if let Some(vf) = format.vf.as_deref() {
                         add_arg(&mut cmd, "-vf", Some(vf));
                     }
@@ -662,6 +697,19 @@ fn run_ffmpeg(
     if do_tap {
         append_tap_post(&mut cmd, tap_dir.unwrap(), total_duration);
     }
+
+    // Log the exact argv before spawning. The tap builds a two-output
+    // filter_complex command, and when one of those graphs fails to configure
+    // FFmpeg's error names a filter pad rather than anything traceable back to
+    // a format id — which is otherwise only diagnosable by bisecting on the
+    // host. Cheap, once per ffmpeg run, and never carries a secret.
+    println!(
+        "ffmpeg argv (format {} do_tap={}): {:?} {:?}",
+        format.id,
+        do_tap,
+        cmd.get_program(),
+        cmd.get_args().collect::<Vec<_>>()
+    );
 
     cmd.stderr(Stdio::piped()).stdout(Stdio::null());
 
@@ -1123,7 +1171,146 @@ mod tests {
             "tap must use fps_mode for cadence"
         );
         assert!(src.contains("-fps_mode"));
-        assert!(src.contains("tap_dir.is_none()")); // standalone -vf guarded when tapping
+        // The standalone `-vf` must be suppressed exactly when the tap folds it
+        // into the filtergraph — i.e. gated on `!do_tap`, NOT on `tap_dir`.
+        // `do_tap` additionally requires a foldable vf and a video codec, so
+        // keying on tap_dir dropped `-vf` from any format that was handed a tap
+        // dir but rejected by either check, silently producing an unscaled
+        // rendition.
+        assert!(
+            src.contains("if !do_tap {"),
+            "the standalone -vf must be gated on !do_tap"
+        );
+    }
+
+    /// A `[k]` pad created but never mapped makes FFmpeg fail at graph
+    /// configure ("Filter ... has an unconnected output"). On the tap-owning
+    /// format that means the whole rendition produces nothing while the job
+    /// still publishes its other renditions — a silent loss of gate coverage,
+    /// and in `enforce` an empty keyframe set holds every video job.
+    /// Reported from production 2026-07-31; pinned here so it cannot recur.
+    #[test]
+    fn test_tap_graph_has_no_dangling_pad() {
+        for vf in [None, Some("scale=1920x1080")] {
+            let mut cmd = Command::new("ffmpeg");
+            append_tap_pre(&mut cmd, vf, "0.50000");
+            cmd.arg("-y").arg("/tmp/out_ue.mp4"); // the main output
+            append_tap_post(&mut cmd, "/tmp/kf", 3600.0);
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let i = args
+                .iter()
+                .position(|a| a == "-filter_complex")
+                .expect("tap builds a filter_complex");
+            let graph = &args[i + 1];
+            for label in ["m", "k"] {
+                let pad = format!("[{}]", label);
+                assert!(graph.contains(&pad), "graph must define {}", pad);
+                assert!(
+                    args.windows(2).any(|w| w[0] == "-map" && w[1] == pad),
+                    "vf={:?}: the graph defines {} but nothing maps it to an output — \
+                     FFmpeg fails at graph configure and the rendition produces nothing.\n\
+                     argv: {}",
+                    vf,
+                    pad,
+                    args.join(" ")
+                );
+            }
+        }
+    }
+
+    /// The producer/consumer pair is split across the GPU and CPU branches:
+    /// two `append_tap_pre` sites, one `append_tap_post` after both. A third
+    /// pre site, or an early return slipped between them, reintroduces the
+    /// dangling pad above.
+    #[test]
+    fn test_every_tap_pre_is_matched_by_the_single_tap_post() {
+        let src = include_str!("transcode_video.rs");
+        let body = &src[src.find("fn run_ffmpeg(").expect("run_ffmpeg present")..];
+        let body = &body[..body.find("\npub async fn ").unwrap_or(body.len())];
+        let pre = body.matches("append_tap_pre(&mut cmd").count();
+        let post = body.matches("append_tap_post(&mut cmd").count();
+        assert_eq!(pre, 2, "GPU and CPU paths each fold the tap into the graph");
+        assert_eq!(
+            post, 1,
+            "exactly one tap output, appended after both branches"
+        );
+        let last_pre = body.rfind("append_tap_pre(&mut cmd").unwrap();
+        let the_post = body.find("append_tap_post(&mut cmd").unwrap();
+        assert!(
+            last_pre < the_post,
+            "the [k] consumer must be appended after every producer"
+        );
+    }
+
+    /// `av1_nvenc` accepts profile `main` only — `high` is an h264 profile.
+    /// Reported from production 2026-07-31 (one entry; there were in fact three
+    /// across the two shipped files).
+    ///
+    /// NOTE: `profile` is currently parsed into `VideoFormat` but never emitted
+    /// to FFmpeg (see the dead field), so a bad value is inert today and cannot
+    /// be what failed a real encode. This pins the data for whenever it is
+    /// wired up.
+    #[test]
+    fn test_shipped_formats_have_valid_nvenc_profiles() {
+        for (name, src) in [
+            (
+                "video_formats.json",
+                include_str!("../settings/video_formats.json"),
+            ),
+            (
+                "video_formats1.json",
+                include_str!("../settings/video_formats1.json"),
+            ),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(src).expect("valid JSON");
+            for f in v.as_array().expect("array of formats") {
+                let vcodec = f.get("vcodec").and_then(|x| x.as_str()).unwrap_or("");
+                let profile = f.get("profile").and_then(|x| x.as_str());
+                if vcodec == "av1_nvenc" {
+                    assert!(
+                        matches!(profile, None | Some("main")),
+                        "{} id {:?}: av1_nvenc accepts profile 'main' only, found {:?}",
+                        name,
+                        f.get("id"),
+                        profile
+                    );
+                }
+            }
+        }
+    }
+
+    /// Host workaround (2026-07-31): NVENC on the production L40S fails with
+    /// "Failed locking bitstream buffer" once B-frame reordering engages.
+    #[test]
+    fn test_nvenc_encoders_get_bf_zero() {
+        for (vcodec, expect_bf) in [
+            ("h264_nvenc", true),
+            ("hevc_nvenc", true),
+            ("av1_nvenc", true),
+            ("libx264", false),
+            ("libaom-av1", false),
+        ] {
+            let mut cmd = Command::new("ffmpeg");
+            add_video_codec(&mut cmd, vcodec);
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                args.windows(2).any(|w| w[0] == "-c:v" && w[1] == vcodec),
+                "{} must still be selected",
+                vcodec
+            );
+            assert_eq!(
+                args.windows(2).any(|w| w[0] == "-bf" && w[1] == "0"),
+                expect_bf,
+                "{}: -bf 0 presence (NVENC only)",
+                vcodec
+            );
+        }
     }
 
     #[test]

@@ -8,15 +8,15 @@ RUN apt-get update && \
   rm -rf /var/lib/apt/lists/*
 
 # Install nv-codec-headers (NVENC/NVDEC API stubs; AV1 NVENC requires >= 12.0)
-RUN git clone --branch n12.2.72.0 --depth 1 https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
+RUN git clone --branch n13.0.19.0 --depth 1 https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
   cd nv-codec-headers && \
   make install && \
   cd .. && rm -rf nv-codec-headers
 
 # Download, configure, and build FFmpeg 7.0.2
-RUN wget -q https://ffmpeg.org/releases/ffmpeg-7.0.2.tar.xz && \
-  tar xf ffmpeg-7.0.2.tar.xz && \
-  cd ffmpeg-7.0.2 && \
+RUN wget -q https://ffmpeg.org/releases/ffmpeg-8.0.tar.xz && \
+  tar xf ffmpeg-8.0.tar.xz && \
+  cd ffmpeg-8.0 && \
   ./configure \
     --prefix=/usr/local \
     --enable-gpl \
@@ -32,7 +32,7 @@ RUN wget -q https://ffmpeg.org/releases/ffmpeg-7.0.2.tar.xz && \
     --disable-doc && \
   make -j$(nproc) && \
   make install && \
-  cd .. && rm -rf ffmpeg-7.0.2 ffmpeg-7.0.2.tar.xz
+  cd .. && rm -rf ffmpeg-8.0 ffmpeg-8.0.tar.xz
 
 # Rust build stage
 FROM rust:1.72 AS build

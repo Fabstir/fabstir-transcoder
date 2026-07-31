@@ -24,6 +24,6 @@
     {"id": 30, "label": "720p", "type": "video/mp4", "ext": "mp4", "vcodec": "av1_nvenc", "ch": 2, "vf": "scale=1280x720", "b:v": "2.75M", "ar": "44k", "gpu": true},
     {"id": 31, "label": "1080p", "type": "video/mp4", "ext": "mp4", "vcodec": "libx264", "preset": "medium", "profile": "main", "ch": 2, "vf": "scale=1920x1080", "b:v": "1.25M", "ar": "44k", "gpu": true},
     {"id": 32, "label": "1080p", "type": "video/mp4", "ext": "mp4", "vcodec": "av1_nvenc", "preset": "medium", "profile": "main", "ch": 2, "vf": "scale=1920x1080", "b:v": "4.5M", "ar": "44k", "gpu": true},
-    {"id": 33, "label": "1440p", "type": "video/mp4", "ext": "mp4", "vcodec": "av1_nvenc", "preset": "slower", "profile": "high", "ch": 2, "vf": "scale=2560x1440", "b:v": "8M", "ar": "48k", "gpu": true},
-    {"id": 34, "label": "2160p", "type": "video/mp4", "ext": "mp4", "vcodec": "av1_nvenc", "preset": "slower", "profile": "high", "ch": 2, "vf": "scale=3840x2160", "b:v": "18M", "ar": "48k", "gpu": true}
+    {"id": 33, "label": "1440p", "type": "video/mp4", "ext": "mp4", "vcodec": "av1_nvenc", "preset": "slower", "profile": "main", "ch": 2, "vf": "scale=2560x1440", "b:v": "8M", "ar": "48k", "gpu": true},
+    {"id": 34, "label": "2160p", "type": "video/mp4", "ext": "mp4", "vcodec": "av1_nvenc", "preset": "slower", "profile": "main", "ch": 2, "vf": "scale=3840x2160", "b:v": "18M", "ar": "48k", "gpu": true}
 ]
