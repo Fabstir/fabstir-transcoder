@@ -24,10 +24,13 @@ use std::process::{Command, Stdio};
 use tokio::io::AsyncReadExt;
 use tonic::{transport::Server, Code, Request, Response, Status};
 
-// QUARANTINED with the A1 tap path (transitively dead; post-M3 deletion follow-up).
-#[allow(dead_code)]
-static PATH_TO_FILE: Lazy<String> =
-    Lazy::new(|| var("PATH_TO_FILE").unwrap_or_else(|_| panic!("PATH_TO_FILE not set in .env")));
+// NOTE (WP-T Task 1.2.4): this module's own `PATH_TO_FILE` static was deleted
+// rather than un-quarantined. It had no user even at 310c30a when the A1 tap was
+// fully live — it was a redundant duplicate of `server.rs`'s static, and the
+// `#[allow(dead_code)]` on it was hiding that rather than deferring a caller.
+// Lifting the allow with no caller would have left a new dead-code warning, and
+// the plan forbids silencing that with a fresh allow. Never initialised, so
+// deleting it is behaviour-neutral.
 static PATH_TO_TRANSCODED_FILE: Lazy<String> = Lazy::new(|| {
     var("PATH_TO_TRANSCODED_FILE")
         .unwrap_or_else(|_| panic!("PATH_TO_TRANSCODED_FILE not set in .env"))
@@ -192,8 +195,7 @@ pub fn hls_output_dir(file_name: &str) -> String {
 const TAP_SCALE: &str = "scale='min(512,iw)':-2";
 
 /// Per-job directory holding the sampled moderation keyframe PNGs.
-/// QUARANTINED (A1 tap superseded by the M3 sidecar, HAND-OFF §6; post-M3 deletion follow-up).
-#[allow(dead_code)]
+/// Revived for WP-T (IMPLEMENTATION-MODERATION-FRAMES-GATE-WPT.md).
 pub fn modtap_dir(task_id: &str) -> String {
     format!("{}{}_modtap", *PATH_TO_TRANSCODED_FILE, task_id)
 }
@@ -201,8 +203,7 @@ pub fn modtap_dir(task_id: &str) -> String {
 /// True if the source has at least one video stream. ffprobe-based; on ANY
 /// error/ambiguity returns `true` (fail-closed — a probe false-negative must never
 /// make a video source look audio-only).
-/// QUARANTINED (A1 tap superseded by the M3 sidecar, HAND-OFF §6; post-M3 deletion follow-up).
-#[allow(dead_code)]
+/// Revived for WP-T (IMPLEMENTATION-MODERATION-FRAMES-GATE-WPT.md).
 pub fn source_has_video(path: &str) -> bool {
     match Command::new("ffprobe")
         .args([
@@ -232,8 +233,7 @@ pub fn source_has_video(path: &str) -> bool {
 /// all audio (no transcode to tee from): its own ffmpeg child is the job's sole
 /// video decode. Spawn/wait failures AND a non-zero exit ⇒ `Err` (never panic),
 /// so the Phase-5 gate leaves `tap_ok = false` ⇒ HOLD.
-/// QUARANTINED (A1 tap superseded by the M3 sidecar, HAND-OFF §6; post-M3 deletion follow-up).
-#[allow(dead_code)]
+/// Revived for WP-T (IMPLEMENTATION-MODERATION-FRAMES-GATE-WPT.md).
 pub fn tap_source_keyframes(file_path: &str, tap_dir: &str) -> Result<(), Status> {
     std::fs::create_dir_all(tap_dir)
         .map_err(|e| Status::new(Code::Internal, format!("modtap dir: {}", e)))?;
@@ -244,7 +244,7 @@ pub fn tap_source_keyframes(file_path: &str, tap_dir: &str) -> Result<(), Status
         TAP_SCALE
     );
     let out = format!("{}/kf_%05d.png", tap_dir);
-    let cap = moderation::keyframe_max().to_string(); // hard budget cap (see append_tap_post)
+    let cap = moderation::frames_cap(d).to_string(); // duration-derived (see append_tap_post)
     let status = Command::new("ffmpeg")
         .args([
             "-v",
@@ -304,12 +304,14 @@ fn append_tap_pre(cmd: &mut Command, vf: Option<&str>, fps: &str) {
 }
 
 /// Append the keyframe PNG tap output. MUST follow the main `-y <output>`.
-fn append_tap_post(cmd: &mut Command, dir: &str) {
+fn append_tap_post(cmd: &mut Command, dir: &str, total_duration: f64) {
     let png = format!("{}/kf_%05d.png", dir);
-    // Hard budget cap (backstop): bounds frame production even if the duration probe
-    // fails (`0.0` ⇒ the adaptive interval can't widen). Never truncates a correctly
-    // probed source (count is already <= budget); prevents an unbounded-PNG OOM/disk DoS.
-    let cap = moderation::keyframe_max().to_string();
+    // Backstop against unbounded PNG production (OOM/disk). Derived from the
+    // duration so it can never front-truncate a probed source: past the §0.5.11
+    // interval cap the expected count exceeds `keyframe_max`, and a flat cap
+    // there would chop the tail off any title over ~3 h 20 m (Q7 / Task 1.4.5).
+    // An unprobeable source (`0.0`) still falls back to the flat budget.
+    let cap = moderation::frames_cap(total_duration).to_string();
     cmd.args([
         "-map",
         "[k]",
@@ -374,9 +376,9 @@ fn run_ffmpeg(
     let do_tap = tap_dir.is_some()
         && vf_foldable(format.vf.as_deref())
         && format.vcodec.as_deref().is_some_and(|v| !v.is_empty());
-    // Tap-only (A1, quarantined): computed lazily so the sampling env knobs
-    // (MODERATION_SAMPLE_INTERVAL_SECS / _KEYFRAME_MAX) are never read on the
-    // live tap-less path — `transcode_video()` always passes `tap_dir: None`.
+    // Tap-only: computed lazily so the sampling env knobs
+    // (MODERATION_SAMPLE_INTERVAL_SECS / _KEYFRAME_MAX / _MAX_INTERVAL_SECS) are
+    // never read on the tap-less path (`MODERATION_GATE=off` passes `tap_dir: None`).
     let fps_str = if do_tap {
         format!(
             "{:.5}",
@@ -658,7 +660,7 @@ fn run_ffmpeg(
     // Append the keyframe PNG tap output AFTER the main `-y <output>` (its `-map [k]`
     // binds to this last output file).
     if do_tap {
-        append_tap_post(&mut cmd, tap_dir.unwrap());
+        append_tap_post(&mut cmd, tap_dir.unwrap(), total_duration);
     }
 
     cmd.stderr(Stdio::piped()).stdout(Stdio::null());

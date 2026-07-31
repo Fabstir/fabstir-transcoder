@@ -47,6 +47,55 @@ services:
       # - S5_ROOT_CA=${S5_ROOT_CA:-}
       # - PORTAL_URL=${PORTAL_URL:-}
 
+      # ── WP-T content-moderation publish gate ──────────────────────────────
+      # All defaulted to the OFF state: with MODERATION_GATE unset or `off` the
+      # transcoder behaves exactly as a pre-WP-T build — no keyframe tap, no
+      # POST, no gate. Spec: docs/development/IMPLEMENTATION-MODERATION-FRAMES-GATE-WPT.md
+      #
+      # ⚠️ MODERATION_GATE accepts ONLY off | dark | enforce. Any other value is
+      #    BOOT-FATAL — the container exits(1) naming the bad value, so under a
+      #    restart policy a typo shows up as a crash-loop at deploy time rather
+      #    than silently disarming the gate. `off`/unset is the safe default.
+      # ⚠️ Do NOT set `enforce` until the node ships its own-hash file (WP-N2):
+      #    until then every verdict is a fail-closed hold, i.e. 100% of jobs
+      #    hold. Flip order across the fleet is: all gates to `dark` first, then
+      #    `enforce` transcoder → node → SDK, each after soak.
+      - MODERATION_GATE=${MODERATION_GATE:-off}
+
+      # Shared secret, sent as the `ingestToken` BODY field (never a header).
+      # REQUIRED by the node once the gate is armed: unset here (or unset on the
+      # node) ⇒ 401 on every POST ⇒ every job holds, with one ALERT per job.
+      # Must match the node's MODERATION_INGEST_TOKEN exactly — see WP-O below.
+      - MODERATION_INGEST_TOKEN=${MODERATION_INGEST_TOKEN:-}
+
+      # Node base URL for POST /v1/moderate/frames. Unset while armed ⇒ hold.
+      - MODERATION_NODE_URL=${MODERATION_NODE_URL:-}
+
+      # Per-call deadline for the frames POST, in seconds. Deliberately NOT
+      # MODERATION_TIMEOUT_SECS (that is M3's 3 h sidecar deadline) — sharing
+      # them would make a wedged node hold every job for three hours.
+      - MODERATION_FRAMES_TIMEOUT_SECS=${MODERATION_FRAMES_TIMEOUT_SECS:-30}
+
+      # Keyframe sampling: floor interval, cap interval, and frame budget.
+      # The budget widens the interval on long content (never front-truncates);
+      # the cap bounds how coarse that widening may get. PART-A §0.5.11 requires
+      # sampling never coarser than ~10-15 s even on a 6 h title.
+      - MODERATION_SAMPLE_INTERVAL_SECS=${MODERATION_SAMPLE_INTERVAL_SECS:-2.0}
+      - MODERATION_MAX_INTERVAL_SECS=${MODERATION_MAX_INTERVAL_SECS:-12.0}
+      - MODERATION_KEYFRAME_MAX=${MODERATION_KEYFRAME_MAX:-1000}
+
+      # ── WP-O deployment reminder ──────────────────────────────────────────
+      # 1. MODERATION_INGEST_TOKEN must be pinned JOINTLY with the node owner and
+      #    set identically on every node this transcoder POSTs to. Generate with
+      #    `openssl rand -hex 32`. An unset secret never means "accept all" —
+      #    the node rejects every request if its own copy is unset.
+      # 2. The node's MODERATION_ENFORCE stays false until Milestone 2. It is a
+      #    separate, node-side switch and is independent of MODERATION_GATE here.
+      # 3. MODERATION_GATE is independent of MODERATION_ENABLED (the M3 shadow
+      #    sidecar switch). Every combination is supported; their one interaction
+      #    is that an armed gate suppresses the shadow path's verdict relay so
+      #    only one writer records a verdict per job.
+
     # Expose the transcoder's gRPC + HTTP ports for local testing
     ports:
       - "50051:50051"

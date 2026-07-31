@@ -8,6 +8,15 @@
 # launch. Everything else is per HANDOFF-TRANSCODER-M3.md (§2 topology; §3
 # scoped erratum) + CONTRACT-MODERATION-SERVICE.md.
 #
+# ── SCOPE: this file is M3 ONLY. WP-T's publish gate does not need it. ──────
+# The WP-T frames gate (MODERATION_GATE=off|dark|enforce, in the transcoder's
+# own compose) talks HTTP to the NODE, not to this sidecar. It needs only
+# MODERATION_NODE_URL reachability and a matching MODERATION_INGEST_TOKEN — no
+# sidecar, no GPU, no image digest. So the DO-NOT-LAUNCH block above does NOT
+# gate WP-T: do not hold the frames gate behind this file's digest re-pin by
+# association. The two paths are independent, and an armed gate merely
+# suppresses this path's verdict relay (one verdict writer per job).
+#
 # D12 — the one absolute rule: run the pinned image BY DIGEST as a sidecar.
 # Never a mutable tag. Never `pip install` / copy the moderation code into the
 # transcoder image. NEVER mount anything over /work in the sidecar — its

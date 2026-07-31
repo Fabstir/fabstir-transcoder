@@ -20,7 +20,10 @@ mod utils;
 use utils::{base64url_to_bytes, bytes_to_base64url, download_and_concat_files, download_video};
 
 mod transcode_video;
-use transcode_video::{get_video_format_from_str, transcode_video, TranscodeVideoResponse};
+use transcode_video::{
+    get_video_format_from_str, transcode_video, transcode_video_produce, transcode_video_publish,
+    LocalOutput, TranscodeVideoResponse,
+};
 
 mod hls_segment;
 mod moderation;
@@ -404,6 +407,34 @@ async fn process_single_job(
         spawn_shadow_moderation(task_id.clone(), file_path.clone());
     }
 
+    // ── WP-T publish gate (three-state MODERATION_GATE; default off) ──
+    let gate = moderation::gate_mode();
+    let client = moderation::default_client();
+    let tap_dir = transcode_video::modtap_dir(&task_id);
+    // Probe the SOURCE (now on disk), not output codecs; `&&` short-circuits so a
+    // disabled run never spawns ffprobe. On probe error, source_has_video ⇒ true ⇒ HOLD.
+    let scan_required = gate.moderates() && transcode_video::source_has_video(&file_path);
+    if gate.moderates() {
+        // Defense-in-depth: clear any stale tap dir before producing this job's keyframes
+        // so the gate can never read a prior run's PNGs. (task_id is a fresh UUID, so this
+        // is belt-and-braces.) Dark-launch parity: guarded by the gate.
+        let _ = fs::remove_dir_all(&tap_dir);
+    }
+    // ── GC pins (Task 3.1.4) ──────────────────────────────────────────────────
+    // `garbage_collect` runs on PATH_TO_TRANSCODED_FILE as well as PATH_TO_FILE,
+    // and it deletes NEWEST-first — so during the gate's produce→publish window
+    // the tap dir and the held outputs are precisely its first candidates. Each
+    // unpinned artefact would fail silently, and differently: a reaped tap dir ⇒
+    // a spurious fail-closed HOLD of clean content; reaped outputs ⇒ publish
+    // uploads nothing; a source reaped mid-hash ⇒ the own-hash exact match
+    // degrades with no error anywhere. RAII: every pin releases on every path,
+    // including the early `return` in the HOLD branch and on panic.
+    let _tap_pin = gate.moderates().then(|| moderation::pin(&tap_dir));
+    let mut output_pins: Vec<moderation::PinGuard> = Vec::new();
+    let mut pending: Vec<LocalOutput> = Vec::new();
+    let mut tap_ok = !scan_required; // audio source: nothing to tap, empty set is clearable
+    let mut tapped = false; // has the tap been assigned to a video output yet?
+
     for (index, video_format) in media_formats_vec.iter().enumerate() {
         let video_format_str = match serde_json::to_string(&video_format) {
             Ok(str) => str,
@@ -422,8 +453,8 @@ async fn process_single_job(
             }
         };
 
-        {
-            // ── The single transcode path (M3: shadow moderation never alters this flow) ──
+        if !gate.moderates() {
+            // ── Gate off: legacy inline produce+publish, byte-identical to today ──
             if !check_transcoded_file_exists(
                 file_path.as_str(),
                 &format.id.to_string(),
@@ -473,6 +504,168 @@ async fn process_single_job(
                         eprintln!("Error transcoding video: {:?}", e);
                         continue;
                     }
+                }
+            }
+            continue;
+        }
+
+        // ── Armed: produce-only; publish is deferred until the verdict ──
+        let fmt_has_video = video_format["vcodec"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty());
+        // The tap owner must ALSO have a foldable vf — a non-foldable-vf format emits no
+        // PNGs (run_ffmpeg's do_tap), so letting it claim the tap would permanently HOLD the
+        // job; instead a later foldable format or the source-tap fallback handles it.
+        let want_tap =
+            fmt_has_video && transcode_video::vf_foldable(video_format["vf"].as_str()) && !tapped;
+        // Cache short-circuit applies to non-tap formats only; the tap owner always
+        // re-emits a fresh keyframe set (never moderate a stale/empty cached dir).
+        if !want_tap
+            && check_transcoded_file_exists(
+                file_path.as_str(),
+                &format.id.to_string(),
+                format.ext.as_str(),
+            )
+            .await
+        {
+            continue;
+        }
+        let this_tap = if want_tap {
+            Some(tap_dir.as_str())
+        } else {
+            None
+        };
+        match transcode_video_produce(
+            task_id.clone(),
+            index,
+            &file_path,
+            &video_format_str,
+            is_encrypted,
+            is_gpu,
+            preview_percent,
+            this_tap,
+        )
+        .await
+        {
+            Ok(out) => {
+                if want_tap {
+                    tapped = true;
+                    tap_ok = true; // the tap-owning ffmpeg run succeeded
+                }
+                // Pin the held output for the produce→publish window (Task 3.1.4).
+                output_pins.push(moderation::pin(&held_output_path(&out)));
+                pending.push(out);
+            }
+            Err(e) => {
+                eprintln!("Error producing format {}: {:?}", index, e);
+                if want_tap {
+                    tapped = true; // tap owner attempted+failed → tap_ok stays false ⇒ HOLD
+                }
+                // NEVER return/`?`: fall through so the gate + held-status still run.
+            }
+        }
+    }
+
+    if gate.moderates() {
+        // Dedicated source tap for audio-only OUTPUTS of a video source (nothing to tee
+        // from): its own ffmpeg child is the job's sole video decode.
+        if scan_required && !tapped {
+            match transcode_video::tap_source_keyframes(&file_path, &tap_dir) {
+                Ok(()) => tap_ok = true,
+                Err(e) => eprintln!("Source keyframe tap failed: {:?}", e), // tap_ok stays false ⇒ HOLD
+            }
+        }
+
+        // ONE read of the tap dir; the integrity check AND the POST share this set (no TOCTOU).
+        let kf: Vec<Vec<u8>> = read_keyframe_pngs(&tap_dir);
+        let outcome = if scan_required && (!tap_ok || kf.is_empty()) {
+            // Video source with an absent/partial/empty keyframe set: HOLD, and do NOT POST
+            // (never let the node store a false `Cleared` for unscanned video).
+            moderation::ModerationOutcome::Unavailable
+        } else {
+            // Optional own-hash exact-match input, computed ONLY when there is
+            // actually something to POST. The `kf.is_empty()` guard matters:
+            // an audio-only source reaches this branch (scan_required is false)
+            // but the client's Q5 empty-set guard then returns without POSTing,
+            // so hashing here would stream a multi-GB file to produce a value
+            // nothing ever reads. The verdict is identical either way.
+            //
+            // Off-reactor: hashing streams the whole source. Any failure
+            // (JoinError or hash error) ⇒ None — the optional SHA is simply
+            // omitted and the node verdict still governs (fail-closed unchanged).
+            // Pinned for the duration: a reap mid-hash silently omits the field,
+            // and the own-hash exact match is what Milestone 1a depends on.
+            let source_sha = if kf.is_empty() {
+                None
+            } else {
+                let _source_pin = moderation::pin(&file_path);
+                let fp = file_path.clone();
+                tokio::task::spawn_blocking(move || moderation::sha256_file(&fp))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+            };
+            client.moderate(&task_id, &kf, source_sha).await
+        };
+
+        if !moderation::may_publish(&outcome) {
+            if gate.holds() {
+                // ── HOLD: upload nothing; discard local temp; record held status ──
+                eprintln!("MODERATION HOLD task_id={} outcome={:?}", task_id, outcome);
+                let held_duration = pending.first().map(|o| o.total_duration).unwrap_or(0.0);
+                for out in &pending {
+                    if out.is_hls {
+                        let _ = fs::remove_dir_all(held_output_path(out));
+                    } else {
+                        let _ = fs::remove_file(held_output_path(out));
+                    }
+                }
+                let _ = fs::remove_dir_all(&tap_dir);
+                let mut transcoded = TRANSCODED.lock().await;
+                transcoded.insert(task_id.clone(), ("[]".to_string(), held_duration));
+                drop(transcoded);
+                for i in 0..formats_count {
+                    shared::update_progress(&task_id, i, 100);
+                }
+                return;
+            }
+            // ── DARK (Milestone 1): record what WOULD have been held, then fall
+            //    INTO the publish branch below — not around it — so the tap-dir
+            //    cleanup it performs still runs. Publishing anyway is the entire
+            //    point of dark mode; the ordering is identical to `enforce`'s so
+            //    that soaking here genuinely exercises the path `enforce` will take.
+            println!(
+                "MODERATION WOULD-HOLD task_id={} outcome={:?}",
+                task_id, outcome
+            );
+        }
+
+        // ── Cleared (or dark): discard the tap, then publish each deferred output ──
+        let _ = fs::remove_dir_all(&tap_dir);
+        for out in pending {
+            let video_format_value = out.video_format.clone();
+            let is_hls = out.is_hls;
+            let dest = out.dest.clone();
+            match transcode_video_publish(out).await {
+                Ok(resp) => {
+                    let response = resp.into_inner();
+                    if source_duration == 0.0 && response.duration > 0.0 {
+                        source_duration = response.duration;
+                    }
+                    if response.status_code != 200 {
+                        eprintln!(
+                            "Publish failed with status {}: {}",
+                            response.status_code, response.message
+                        );
+                        continue;
+                    }
+                    let mut video_format_modified = video_format_value;
+                    apply_cid_metadata(&mut video_format_modified, &response, is_hls, &dest);
+                    transcoded_formats.push(video_format_modified);
+                }
+                Err(e) => {
+                    eprintln!("Error publishing format: {:?}", e);
+                    continue;
                 }
             }
         }
@@ -555,7 +748,18 @@ fn spawn_shadow_moderation(task_id: String, file_path: String) {
             call_ms,
             moderation::outcome_log_fragment(&outcome)
         );
-        if let Some(envelope) = moderation::build_relay_envelope(&task_id, &outcome) {
+        // Q2: one authoritative verdict writer per job. Everything above this
+        // point still runs when the gate is armed — the POST, the
+        // classification, the wall-clock log, and the sidecar's own JSONL sink
+        // — so shadow evidence collection is completely unaffected. ONLY the
+        // node-side write is withheld, because node verdicts are monotonic and
+        // an OQ-12 VLM false positive over a Track-1 `cleared` is permanent.
+        if !moderation::should_relay() {
+            println!(
+                "MODERATION SHADOW task_id={} relay suppressed: MODERATION_GATE armed (Q2)",
+                task_id
+            );
+        } else if let Some(envelope) = moderation::build_relay_envelope(&task_id, &outcome) {
             if let Err(e) = moderation::default_relay().relay(&task_id, &envelope).await {
                 eprintln!("MODERATION SHADOW task_id={} relay error: {:?}", task_id, e);
             }
@@ -807,13 +1011,29 @@ impl RestHandler {
     }
 }
 
-/// ── QUARANTINED (A1/A3/A4 — retired per Q1(a); deletion is a scheduled
-/// post-M3 follow-up, see IMPLEMENTATION-MODERATION-SIDECAR-M3.md) ──
+/// The local path a produced-but-unpublished output occupies while the gate
+/// holds it.
+///
+/// Used BOTH to pin it against GC and to delete it on a HOLD, deliberately, so
+/// the two can never drift: `moderation::is_pinned` is an EXACT string match
+/// against what `read_dir().path()` yields, so a near-miss path protects
+/// nothing and fails silently. One function, one string shape.
+fn held_output_path(out: &LocalOutput) -> String {
+    if out.is_hls {
+        transcode_video::hls_output_dir(&out.file_name)
+    } else {
+        format!(
+            "{}{}_ue.{}",
+            *PATH_TO_TRANSCODED_FILE, out.file_name, out.ext
+        )
+    }
+}
+
+/// Revived for WP-T (IMPLEMENTATION-MODERATION-FRAMES-GATE-WPT.md).
 /// Read the tap dir's keyframe PNGs into memory, sorted by filename. A missing/empty
 /// dir maps to an empty `Vec`; ANY per-file read error also maps to empty (fail-closed —
 /// a partial set must never be scanned as complete). The gate's SINGLE read of the tap:
 /// the integrity check and the POST share this in-memory set (no TOCTOU).
-#[allow(dead_code)]
 fn read_keyframe_pngs(tap_dir: &str) -> Vec<Vec<u8>> {
     let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(tap_dir) {
         Ok(rd) => rd
@@ -958,6 +1178,16 @@ struct QueryParams {
 async fn main() {
     dotenv().ok();
 
+    // Q1(b) — a set-but-unrecognised MODERATION_GATE is BOOT-FATAL. This must
+    // run before either listener binds and before any job can be accepted: a
+    // validation that runs afterwards is not "refuse to start". Under compose's
+    // restart policy a typo surfaces as a crash-loop at deploy time, which is
+    // the intent — loud, immediate, and while someone is watching.
+    if let Err(e) = moderation::validate_gate_mode() {
+        eprintln!("FATAL: MODERATION_GATE — {}", e);
+        std::process::exit(1);
+    }
+
     let (task_sender, task_receiver) = mpsc::channel::<TranscodeJob>(100);
     let task_receiver = Arc::new(Mutex::new(task_receiver));
     tokio::spawn(transcode_task_receiver(Arc::clone(&task_receiver)));
@@ -1077,10 +1307,302 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::moderation::{
+        may_publish, GateMode, ModerationClient, ModerationOutcome, StubModerationClient,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The production source with the test module stripped off.
+    ///
+    /// Structural assertions MUST search this rather than the whole file. A
+    /// `src.contains("...")` over the whole file is satisfied by the *test's
+    /// own string literal*, so it passes even if the production code it claims
+    /// to check were deleted entirely — a silently vacuous assertion. Slicing
+    /// the tests away makes that impossible without needing `concat!` tricks
+    /// at every call site.
+    fn job_flow_src() -> &'static str {
+        let src = include_str!("server.rs");
+        &src[..src.find("\n#[cfg(test)]").expect("test module marker")]
+    }
+
+    #[test]
+    fn test_job_flow_src_excludes_the_test_module() {
+        // Guards the guard: if this ever returned the whole file, every
+        // structural assertion below would quietly become vacuous.
+        let flow = job_flow_src();
+        assert!(flow.contains("async fn process_single_job"));
+        assert!(
+            !flow.contains("fn test_job_flow_src_excludes_the_test_module"),
+            "job_flow_src must not include the test module"
+        );
+    }
+
+    /// A client that delays then returns a (late) `Unavailable` — models a verdict
+    /// arriving after the timeout window.
+    struct SlowStub;
+    #[async_trait::async_trait]
+    impl ModerationClient for SlowStub {
+        async fn moderate(
+            &self,
+            _t: &str,
+            _k: &[Vec<u8>],
+            _s: Option<String>,
+        ) -> ModerationOutcome {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            ModerationOutcome::Unavailable
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gate_publishes_only_on_cleared() {
+        // The publish seam (an AtomicUsize) runs iff may_publish — exactly once for
+        // Cleared, zero for every other outcome.
+        for (outcome, expect) in [
+            (ModerationOutcome::Cleared, 1usize),
+            (ModerationOutcome::Blocked, 0),
+            (ModerationOutcome::Flagged, 0),
+            (ModerationOutcome::Unavailable, 0),
+        ] {
+            let published = AtomicUsize::new(0);
+            let client = StubModerationClient { outcome };
+            let verdict = client.moderate("task", &[], None).await;
+            if may_publish(&verdict) {
+                published.fetch_add(1, Ordering::SeqCst);
+            }
+            assert_eq!(published.load(Ordering::SeqCst), expect);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_node_down_holds() {
+        // Unavailable models down / timeout / 404 / 4xx / 5xx ⇒ never publish.
+        let client = StubModerationClient {
+            outcome: ModerationOutcome::Unavailable,
+        };
+        let verdict = client.moderate("task", &[], None).await;
+        assert!(!may_publish(&verdict));
+    }
+
+    #[tokio::test]
+    async fn test_slow_verdict_holds() {
+        // We AWAIT the (late) verdict before any publish — never publish-then-block.
+        let published = AtomicUsize::new(0);
+        let verdict = SlowStub.moderate("task", &[], None).await;
+        if may_publish(&verdict) {
+            published.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(published.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_process_single_job_gates_before_publish() {
+        let src = job_flow_src();
+        // needles via concat! so this test's own literals don't self-match
+        let moderate = concat!("client.", "moderate(");
+        let publish = concat!("transcode_video_", "publish(");
+        // NEEDLE CHANGED on revival (Task 3.3.1): the gate is guarded by
+        // `gate_mode()`, not by M3's shadow-invocation switch. Left as the old
+        // needle this test would still pass — satisfied by the shadow-spawn
+        // guard — while asserting nothing whatsoever about the gate.
+        let guard = concat!("gate_", "mode()");
+        let mod_idx = src.find(moderate).expect("gate moderate call present");
+        let pub_idx = src.find(publish).expect("publish call present");
+        assert!(mod_idx < pub_idx, "moderate must run before publish");
+        assert!(src.contains(guard), "gate guarded by gate_mode()");
+        assert!(src.contains("may_publish"));
+    }
+
+    /// Task 3.3.2 — the GateMode matrix. `dark` publishes on EVERY outcome;
+    /// `enforce` publishes only on `Cleared`. This is the one behavioural
+    /// difference between the two modes, and the reason a boolean switch could
+    /// not express Milestone 1.
+    #[tokio::test]
+    async fn test_gate_mode_matrix_dark_publishes_enforce_holds() {
+        // The expectations are LITERAL, deliberately not derived from
+        // `may_publish()`. Computing them from the same predicate the wiring
+        // uses would make the assertion a restatement of the code under test —
+        // it would pass whatever `holds()` returned. Written out by hand, the
+        // Dark column proves dark never withholds and the Enforce column
+        // proves only `Cleared` publishes.
+        for (outcome, dark_publishes, enforce_publishes) in [
+            (ModerationOutcome::Cleared, true, true),
+            (ModerationOutcome::Blocked, true, false),
+            (ModerationOutcome::Flagged, true, false),
+            (ModerationOutcome::Unavailable, true, false),
+        ] {
+            for (mode, expect) in [
+                (GateMode::Dark, dark_publishes),
+                (GateMode::Enforce, enforce_publishes),
+            ] {
+                let published = AtomicUsize::new(0);
+                let client = StubModerationClient {
+                    outcome: outcome.clone(),
+                };
+                let verdict = client.moderate("task", &[], None).await;
+                // The decision exactly as the wiring makes it: withhold only
+                // when the mode holds AND the verdict is not publishable.
+                if !(mode.holds() && !may_publish(&verdict)) {
+                    published.fetch_add(1, Ordering::SeqCst);
+                }
+                assert_eq!(
+                    published.load(Ordering::SeqCst),
+                    usize::from(expect),
+                    "mode {:?} outcome {:?}",
+                    mode,
+                    outcome
+                );
+            }
+        }
+    }
+
+    /// The three-way split IS the gate, and it lives in a job flow that cannot
+    /// be unit-tested — so pin its control-flow shape structurally. This is the
+    /// assertion the behavioural matrix above cannot make: that `enforce`'s
+    /// hold returns before the publish loop, and that `dark` falls INTO that
+    /// loop rather than around it (so the tap-dir cleanup still runs).
+    #[test]
+    fn test_three_way_split_returns_in_enforce_and_falls_through_in_dark() {
+        let src = job_flow_src();
+        let start = src
+            .find("if !moderation::may_publish(&outcome) {")
+            .expect("gate decision present");
+        let region = &src[start..];
+        let holds = region
+            .find("if gate.holds() {")
+            .expect("the hold branch must be guarded by gate.holds()");
+        let hold_log = region
+            .find(concat!("MODERATION", " HOLD task_id="))
+            .expect("hold log present");
+        let ret = region.find("return;").expect("the hold path must return");
+        let would = region.find("WOULD-HOLD").expect("dark log present");
+        let publish = region
+            .find(concat!("transcode_video_", "publish("))
+            .expect("publish loop present");
+        assert!(holds < hold_log, "the HOLD log sits inside gate.holds()");
+        assert!(hold_log < ret, "the HOLD path logs, then returns");
+        assert!(
+            ret < would,
+            "WOULD-HOLD must be OUTSIDE the holds branch — dark must not return"
+        );
+        assert!(
+            would < publish,
+            "dark logs WOULD-HOLD then falls INTO the publish loop"
+        );
+        // The one that matters most, and the one an ordering check alone
+        // MISSES: a `return` inserted after the WOULD-HOLD log would silently
+        // stop dark mode publishing — destroying Milestone 1 — while leaving
+        // every index above in the same order. Assert the fall-through
+        // directly: nothing may exit the function between the dark log and the
+        // publish loop it is supposed to fall into.
+        assert!(
+            !region[would..publish].contains("return"),
+            "no early exit may sit between WOULD-HOLD and the publish loop — \
+             dark must fall INTO it, not around it"
+        );
+    }
+
+    /// Task 3.3.3 — dark-launch parity: `Off` must reach neither the tap, the
+    /// POST, nor the gate. Structural, because it is an absence in a job flow.
+    #[test]
+    fn test_gate_off_taps_nothing_and_posts_nothing() {
+        let src = job_flow_src();
+        // Every gate-path side effect is guarded by `gate.moderates()`, which is
+        // false for Off — so none of them is reachable with the gate unset.
+        for guarded in [
+            "let scan_required = gate.moderates()",
+            "let _tap_pin = gate.moderates()",
+        ] {
+            assert!(src.contains(guarded), "missing gate guard: {}", guarded);
+        }
+        // The keyframe read and the POST must sit inside the ARMED block. Use
+        // rfind, not find: the first `if gate.moderates() {` is the stale-tap
+        // pre-clear near the top of the job, so anchoring on it would make this
+        // assertion trivially true and prove nothing about containment.
+        let arm = src
+            .rfind("if gate.moderates() {")
+            .expect("gate-armed block present");
+        let read = src
+            .find("read_keyframe_pngs(&tap_dir)")
+            .expect("tap read present");
+        let moderate = src.find("client.moderate(").expect("moderate call present");
+        assert!(
+            arm < read && arm < moderate,
+            "the tap read and the POST must live inside the gate-armed block"
+        );
+        // The tap is only ever handed to produce when a format claims it, and
+        // `want_tap` is only reachable inside the armed branch.
+        assert!(
+            src.contains("let this_tap = if want_tap {"),
+            "tap_dir is passed to produce only via want_tap"
+        );
+        // And Off is genuinely the default.
+        assert_eq!(
+            crate::moderation::parse_gate_mode("").unwrap(),
+            GateMode::Off
+        );
+    }
+
+    /// `held_output_path`'s non-HLS shape must stay identical to the one
+    /// `transcode_video` actually writes and later reads. If they drift, the GC
+    /// pin protects a path that does not exist and the held output is reaped
+    /// mid-window — silently, because `is_pinned` is an exact string match and a
+    /// near-miss simply never matches. Cross-module, so nothing else catches it.
+    #[test]
+    fn test_held_output_path_matches_the_transcoder_output_shape() {
+        let tv = include_str!("transcode_video.rs");
+        assert!(
+            tv.contains(r#"format!("{}{}_ue.{}", *PATH_TO_TRANSCODED_FILE, file_name, ext)"#),
+            "transcode_video must still build the non-HLS output as {{dir}}{{name}}_ue.{{ext}}"
+        );
+        // Both halves, or this proves nothing: asserting only that the
+        // transcoder still uses `_ue.` leaves `held_output_path` free to drift
+        // away from it, which is precisely the silent-pin failure. (Found by
+        // mutating this side and watching the guard survive.)
+        assert!(
+            job_flow_src().contains(r#""{}{}_ue.{}""#),
+            "held_output_path must build the SAME non-HLS shape the transcoder writes"
+        );
+        // The HLS case is not a second spelling: the gate and the transcoder
+        // both go through hls_output_dir, so it cannot drift by construction.
+        assert!(
+            job_flow_src().contains("transcode_video::hls_output_dir(&out.file_name)"),
+            "the gate must derive the HLS dir from hls_output_dir, not rebuild it"
+        );
+    }
+
+    /// The gate pins its held artefacts using the SAME function that later
+    /// deletes them, so the pin string and the delete string cannot drift —
+    /// `is_pinned` is an exact match and a near-miss fails silently (3.1.4).
+    #[test]
+    fn test_held_outputs_are_pinned_with_the_deletion_path_shape() {
+        let src = job_flow_src();
+        assert!(
+            src.contains("moderation::pin(&held_output_path(&out))"),
+            "held outputs must be pinned via held_output_path"
+        );
+        assert!(
+            src.contains("fs::remove_dir_all(held_output_path(out))")
+                && src.contains("fs::remove_file(held_output_path(out))"),
+            "the HOLD path must delete via the same helper it pinned with"
+        );
+        // Three distinct pins on the gate path: tap dir, each output, source.
+        for pin in [
+            "moderation::pin(&tap_dir)",
+            "moderation::pin(&held_output_path(&out))",
+        ] {
+            assert!(src.contains(pin), "missing GC pin: {}", pin);
+        }
+        // The source pin must appear TWICE — once for the M3 shadow window and
+        // once for the gate's sha256_file hash. Asserting mere presence would
+        // be satisfied by the shadow path alone, leaving the gate's hash
+        // unpinned and the own-hash match silently degrading (Task 3.1.4).
+        assert!(
+            src.matches("moderation::pin(&file_path)").count() >= 2,
+            "the gate's own source pin is missing (the shadow path's does not cover it)"
+        );
+    }
 
     // ── M3 — Phase 5.3: shadow-wiring structural tests ────────────────────
-    // (The pre-M3 A4 gate tests that asserted moderate-before-publish and the
-    // publish-predicate wiring were removed with the gate itself — Q1(a): retired.)
 
     #[test]
     fn test_garbage_collect_spares_pinned_file() {
@@ -1102,26 +1624,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The DIRECTORY case (plan Task 3.1.4). The gate pins directories as well
+    /// as files — the tap dir and every held HLS output dir — and GC deletes
+    /// those through a different branch (`remove_dir_all`). `is_pinned` is an
+    /// exact string match, so a near-miss path (trailing slash, un-canonicalised,
+    /// a `_hls` suffix built two different ways) protects nothing and fails
+    /// silently. This proves the directory shape actually matches.
+    #[test]
+    fn test_garbage_collect_spares_pinned_directory() {
+        let dir = std::env::temp_dir().join("wpt_gc_pin_dir_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pinned = dir.join("held_output_hls");
+        let victim = dir.join("unpinned_output_hls");
+        for d in [&pinned, &victim] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("seg0.ts"), [0u8; 64]).unwrap();
+        }
+        let guard = crate::moderation::pin(pinned.to_str().unwrap());
+        garbage_collect(dir.to_str().unwrap(), 0); // threshold 0: delete all it can
+        assert!(pinned.exists(), "pinned output dir must survive GC");
+        assert!(!victim.exists(), "unpinned dir must be collected");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1/D4 — the M3 shadow path can never delay, fail, or block a job.
+    ///
+    /// RESCOPED to `spawn_shadow_moderation`'s body (WP-T Task 3.2.1). The
+    /// original assertions were file-wide, which was a sound proxy only while
+    /// the publish gate was quarantined: the file now legitimately contains
+    /// `may_publish`, `MODERATION HOLD` and `transcode_video_produce` on the
+    /// WP-T gate path. The invariant they were really protecting is that none
+    /// of them appear in the SHADOW path — which is what this asserts directly,
+    /// so the coverage is tightened rather than dropped.
     #[test]
     fn test_shadow_moderation_is_fail_open() {
         let src = include_str!("server.rs");
+        let f_start = src
+            .find("fn spawn_shadow_moderation")
+            .expect("shadow task fn present");
+        let body = &src[f_start..];
+        let body = &body[..body.find("\nasync fn ").unwrap_or(body.len())];
         // needles via concat! so this test's own literals don't self-match
         let may = concat!("may_", "publish");
         let hold = concat!("MODERATION", " HOLD");
         let produce = concat!("transcode_video_", "produce(");
-        // D1/D4: no publish gate, no hold — job flow independent of moderation
-        assert!(!src.contains(may), "no publish gate in the live job flow");
-        assert!(!src.contains(hold), "no hold path");
-        // A1 tap superseded (HAND-OFF §6): the produce/tap path is unreachable
-        assert!(
-            !src.contains(produce),
-            "produce/tap path gone from job flow"
-        );
+        assert!(!body.contains(may), "no publish gate in the shadow path");
+        assert!(!body.contains(hold), "the shadow path never holds a job");
+        assert!(!body.contains(produce), "the shadow path never produces");
         // the shadow task is spawned, guarded only by the invocation switch
         let spawn = concat!("spawn_shadow_", "moderation(");
         let guard = concat!("moderation_", "enabled()");
         assert!(src.contains(spawn), "shadow task spawned");
         assert!(src.contains(guard), "guarded by the invocation switch");
+    }
+
+    /// Task 3.2.2 — the complement. D4's "incapable of delaying a job" has to
+    /// survive a file that now legitimately contains a hold, so assert the
+    /// shadow spawn sits OUTSIDE the gate path and is never awaited.
+    #[test]
+    fn test_shadow_spawn_is_outside_the_gate_and_never_awaited() {
+        let src = job_flow_src();
+        let call = concat!("spawn_shadow_", "moderation(task_id.clone()");
+        let at = src.find(call).expect("shadow spawn call site");
+        let line_end = src[at..].find('\n').map(|e| at + e).unwrap_or(src.len());
+        assert!(
+            !src[at..line_end].contains(".await"),
+            "the shadow spawn must be fire-and-forget, never awaited (D4)"
+        );
+        let gate_at = src
+            .find("let gate = moderation::gate_mode()")
+            .expect("gate present");
+        assert!(
+            at < gate_at,
+            "the shadow spawn must sit outside the gate path, not inside a gate branch"
+        );
     }
 
     #[test]
@@ -1144,6 +1722,43 @@ mod tests {
             "wait/call clocks logged separately (call_ms = CONTRACT §6 number)"
         );
         assert!(body.contains("build_relay_envelope"), "verdicts relayed");
+    }
+
+    /// Q2 — the armed gate suppresses the relay hop and NOTHING else. If this
+    /// guard ever widened to cover the sidecar call, the shadow evidence the
+    /// whole M3 milestone exists to collect would silently stop being gathered;
+    /// if it narrowed away entirely, an OQ-12 VLM false positive could
+    /// permanently poison a job Track-1 had cleared (node verdicts are
+    /// monotonic and `blocked` over `cleared` is irreversible).
+    #[test]
+    fn test_relay_is_suppressed_by_the_gate_but_the_scan_is_not() {
+        let src = include_str!("server.rs");
+        let f_start = src
+            .find("fn spawn_shadow_moderation")
+            .expect("shadow task fn present");
+        let body = &src[f_start..];
+        let body = &body[..body.find("\nasync fn ").unwrap_or(body.len())];
+
+        let guard = body
+            .find("should_relay()")
+            .expect("the relay must be guarded by the gate (Q2)");
+        let relay = body
+            .find("build_relay_envelope")
+            .expect("relay call site present");
+        assert!(guard < relay, "the guard must precede the relay call");
+
+        let scan = body
+            .find("moderate_via_sidecar")
+            .expect("sidecar call present");
+        assert!(
+            scan < guard,
+            "the sidecar POST must happen regardless of the gate — suppressing \
+             the scan would stop shadow evidence collection (D1/D4)"
+        );
+        assert!(
+            body.contains("relay suppressed"),
+            "suppression must be logged, or an absent relay reads as a dead one"
+        );
     }
 
     #[test]
@@ -1343,6 +1958,43 @@ mod tests {
             server_src.contains("tokio::spawn"),
             "receiver must spawn jobs concurrently"
         );
+    }
+
+    /// Q1(b) boot-fatal. `main()` cannot be unit-tested, so assert the ordering
+    /// structurally: a gate validated AFTER the listeners bind is not "refuse to
+    /// start" — jobs could be accepted in the window on a misconfigured host.
+    #[test]
+    fn test_gate_validation_precedes_listener_startup() {
+        let src = job_flow_src();
+        // nth(1) = the text after the real definition (this test's own literal
+        // occurrence is later in the file).
+        let main_body = src
+            .split("async fn main() {")
+            .nth(1)
+            .expect("main() must exist");
+        let validate = main_body
+            .find("validate_gate_mode()")
+            .expect("main() must validate MODERATION_GATE at boot");
+        let exit_at = validate
+            + main_body[validate..]
+                .find("std::process::exit(1)")
+                .expect("an invalid MODERATION_GATE must exit non-zero");
+        for listener in ["Server::builder()", "warp::serve("] {
+            let at = main_body
+                .find(listener)
+                .unwrap_or_else(|| panic!("{} not found in main()", listener));
+            assert!(
+                validate < at,
+                "MODERATION_GATE validation must precede {}",
+                listener
+            );
+            assert!(
+                exit_at < at,
+                "the fatal exit arm must precede {} — otherwise the listener is \
+                 already bound when the container dies",
+                listener
+            );
+        }
     }
 
     #[test]
