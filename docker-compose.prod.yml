@@ -70,7 +70,8 @@ services:
       # Optional knobs — defaults are the agreed Q7 numbers; leave unset unless
       # there is a measured reason. Sampling floor 2s, cap 12s, budget 1000
       # keyframes; frames POST deadline 30s PER BATCH (the sample is split into
-      # batches of <=200 to stay under the node's 20MB body cap).
+      # batches of <=200 keyframes and <=12 MiB raw PNG to stay under the node's
+      # 20 MiB body cap).
       # MODERATION_FRAMES_TIMEOUT_SECS: 30
       # MODERATION_SAMPLE_INTERVAL_SECS: 2.0
       # MODERATION_MAX_INTERVAL_SECS: 12.0

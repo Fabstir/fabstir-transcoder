@@ -331,7 +331,49 @@ fn frames_timeout_secs() -> u64 {
 /// cap, not a per-deployment preference, and the failure mode of setting it too
 /// high (413 ⇒ every long title holds) is exactly the silent one this exists to
 /// remove. Raising it requires the node's cap to change first.
+///
+/// A count alone does NOT keep a batch under the cap: it silently assumes
+/// ~75 KB per keyframe. Real 512-px PNG keyframes run 250-400 KB, so 60-76 of
+/// them (a 2-minute source) already exceed 20 MB in ONE batch and every such job
+/// held with a 413 (host2, 2026-11-04, sessions 1461 and 1462). Batches are
+/// therefore cut by bytes too: see `FRAMES_BATCH_BYTES_MAX` and `plan_batches`.
 const FRAMES_BATCH_MAX: usize = 200;
+
+/// Maximum RAW keyframe bytes per frames POST.
+///
+/// base64 inflates by 4/3, so 12 MiB of PNG becomes 16 MiB of base64 text. The
+/// JSON around it (field names, quotes, commas, taskId, sourceSha256,
+/// ingestToken) is a few bytes per frame plus a few hundred in total, which
+/// leaves about 4 MiB of margin under the node's 20 MiB body cap
+/// (`MODERATION_BODY_LIMIT = 20 * 1024 * 1024` in fabstir-llm-node
+/// `src/api/server.rs`). Same rule as `FRAMES_BATCH_MAX`: a constant, because it
+/// tracks the node's cap; raising it requires the node's cap to change first.
+const FRAMES_BATCH_BYTES_MAX: usize = 12 * 1024 * 1024;
+
+/// Split keyframes into contiguous, in-order batches of at most `max_count`
+/// frames and at most `max_bytes` raw bytes each. Every frame lands in exactly
+/// one batch. A single frame larger than `max_bytes` goes in a batch of its own:
+/// it may still 413, which holds the job fail-closed exactly as today, but it
+/// can no longer drag the frames around it over the cap with it.
+fn plan_batches(frames: &[Vec<u8>], max_count: usize, max_bytes: usize) -> Vec<&[Vec<u8>]> {
+    let max_count = max_count.max(1);
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (i, f) in frames.iter().enumerate() {
+        let n = i - start;
+        if n > 0 && (n == max_count || bytes + f.len() > max_bytes) {
+            batches.push(&frames[start..i]);
+            start = i;
+            bytes = 0;
+        }
+        bytes += f.len();
+    }
+    if start < frames.len() {
+        batches.push(&frames[start..]);
+    }
+    batches
+}
 
 /// Shared secret sent as the `ingestToken` **body** field (PART-A §3.2, REQUIRED).
 /// `None` when unset, so the field is omitted entirely and the node's own
@@ -918,10 +960,13 @@ impl ModerationClient for HttpModerationClient {
             // that once base64 inflates the PNGs by a third, so long titles
             // would 413. That still holds (fail-closed) but silently, and it
             // would push the 30 s deadline while the node decoded 1800 PNGs in
-            // one request. So: sequential batches of at most FRAMES_BATCH_MAX,
-            // each an ordinary §3.2 POST with the same taskId and the same
-            // sourceSha256. The deadline above is PER BATCH.
-            let batches: Vec<&[Vec<u8>]> = frames.chunks(FRAMES_BATCH_MAX).collect();
+            // one request. So: sequential batches of at most FRAMES_BATCH_MAX
+            // keyframes AND at most FRAMES_BATCH_BYTES_MAX raw bytes (a count
+            // alone let 76 real keyframes reach 413), each an ordinary §3.2 POST
+            // with the same taskId and the same sourceSha256. The deadline
+            // above is PER BATCH.
+            let batches: Vec<&[Vec<u8>]> =
+                plan_batches(&frames, FRAMES_BATCH_MAX, FRAMES_BATCH_BYTES_MAX);
             let total = batches.len();
             for (i, batch) in batches.iter().enumerate() {
                 let body =
@@ -962,8 +1007,8 @@ impl ModerationClient for HttpModerationClient {
                 }
             }
             println!(
-                "MODERATION FRAMES task_id={} cleared across {} batch(es) of <={} keyframes",
-                task_id, total, FRAMES_BATCH_MAX
+                "MODERATION FRAMES task_id={} cleared across {} batch(es) of <={} keyframes / <={} raw bytes",
+                task_id, total, FRAMES_BATCH_MAX, FRAMES_BATCH_BYTES_MAX
             );
             ModerationOutcome::Cleared
         })
@@ -1002,8 +1047,8 @@ fn batch_outcome(
         ),
         413 => eprintln!(
             "MODERATION FRAMES ALERT: 413 payload too large from {} — a single batch \
-             exceeded the node's 20 MB body cap; FRAMES_BATCH_MAX is too high for this \
-             keyframe size. This job holds",
+             exceeded the node's 20 MB body cap; FRAMES_BATCH_BYTES_MAX is too high (or one \
+             keyframe alone is over the cap). This job holds",
             url
         ),
         _ => {}
@@ -2113,7 +2158,120 @@ mod tests {
         let worst = 1800_usize;
         assert_eq!((worst + FRAMES_BATCH_MAX - 1) / FRAMES_BATCH_MAX, 9);
         // And the chunking the client actually uses agrees with that.
-        assert_eq!(vec![0u8; worst].chunks(FRAMES_BATCH_MAX).count(), 9);
+        let tiny: Vec<Vec<u8>> = (0..worst).map(|_| vec![0u8; 1]).collect();
+        assert_eq!(
+            plan_batches(&tiny, FRAMES_BATCH_MAX, FRAMES_BATCH_BYTES_MAX).len(),
+            9
+        );
+        // The byte budget, base64-inflated, plus generous JSON overhead, must fit
+        // the node's 20 MiB cap.
+        let node_cap = 20 * 1024 * 1024;
+        let encoded = (FRAMES_BATCH_BYTES_MAX + 2) / 3 * 4;
+        assert!(
+            encoded + FRAMES_BATCH_MAX * 8 + 4096 < node_cap,
+            "byte budget leaves no margin"
+        );
+    }
+
+    /// 2026-11-04, host2 sessions 1461/1462: a 2-minute source tapped 60-76
+    /// keyframes of ~300 KB. Under the count-only cap that was ONE batch of
+    /// ~23 MB raw (~30 MB on the wire) and the node answered 413, holding the job.
+    /// Every batch's real request body must now fit the node's cap.
+    #[test]
+    fn test_real_size_keyframes_split_under_the_node_body_cap() {
+        let node_cap = 20 * 1024 * 1024;
+        let frames: Vec<Vec<u8>> = (0..76u32)
+            .map(|i| vec![(i % 251) as u8; 300 * 1024])
+            .collect();
+        let batches = plan_batches(&frames, FRAMES_BATCH_MAX, FRAMES_BATCH_BYTES_MAX);
+        assert!(batches.len() >= 2, "76 x 300 KB must not be one batch");
+        let mut seen = 0usize;
+        for b in &batches {
+            let raw: usize = b.iter().map(|f| f.len()).sum();
+            assert!(
+                raw <= FRAMES_BATCH_BYTES_MAX,
+                "batch of {} raw bytes over budget",
+                raw
+            );
+            let body =
+                build_request_body("task-real", b, Some("ab".repeat(32)), Some("t".repeat(64)))
+                    .expect("body builds");
+            let wire = serde_json::to_vec(&body).unwrap().len();
+            assert!(
+                wire < node_cap,
+                "batch body {} bytes is over the node's 20 MiB cap",
+                wire
+            );
+            // In order and contiguous: the batch starts where the previous ended.
+            assert_eq!(b[0], frames[seen], "frames must stay in order");
+            seen += b.len();
+        }
+        assert_eq!(seen, 76, "every keyframe sent exactly once");
+    }
+
+    /// A single keyframe bigger than the byte budget travels alone, so it cannot
+    /// take its neighbours over the cap with it (it may still 413 and hold).
+    #[test]
+    fn test_an_oversized_keyframe_goes_alone() {
+        let big = vec![9u8; FRAMES_BATCH_BYTES_MAX + 1];
+        let frames = vec![vec![1u8; 10], big.clone(), vec![2u8; 10], vec![3u8; 10]];
+        let batches = plan_batches(&frames, FRAMES_BATCH_MAX, FRAMES_BATCH_BYTES_MAX);
+        let sizes: Vec<usize> = batches.iter().map(|b| b.len()).collect();
+        assert_eq!(sizes, vec![1, 1, 2]);
+        assert_eq!(batches[1][0].len(), big.len());
+        assert!(plan_batches(&[], FRAMES_BATCH_MAX, FRAMES_BATCH_BYTES_MAX).is_empty());
+
+        // Oversized as the FIRST frame: no empty leading batch, which would POST
+        // zero keyframes, draw a 400 and hold a job that could have cleared.
+        let frames = vec![big.clone(), vec![2u8; 10]];
+        let sizes: Vec<usize> = plan_batches(&frames, FRAMES_BATCH_MAX, FRAMES_BATCH_BYTES_MAX)
+            .iter()
+            .map(|b| b.len())
+            .collect();
+        assert_eq!(sizes, vec![1, 1]);
+
+        // Exactly on budget still fits: the budget is inclusive.
+        let half = vec![1u8; FRAMES_BATCH_BYTES_MAX / 2];
+        let frames = vec![half.clone(), half];
+        assert_eq!(
+            plan_batches(&frames, FRAMES_BATCH_MAX, FRAMES_BATCH_BYTES_MAX).len(),
+            1
+        );
+    }
+
+    /// The wiring, end to end through `moderate()`: real-size keyframes reach the
+    /// node as several POSTs, each under the cap, and the job clears.
+    #[tokio::test]
+    async fn test_real_size_keyframes_reach_the_node_in_several_posts() {
+        let _serial = NODE_URL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let node = FakeNode::start(&["cleared"]);
+        std::env::set_var("MODERATION_NODE_URL", node.url());
+        let frames: Vec<Vec<u8>> = (0..76u32)
+            .map(|i| vec![(i % 251) as u8; 300 * 1024])
+            .collect();
+        let outcome = HttpModerationClient
+            .moderate("task-real", &frames, None)
+            .await;
+        std::env::remove_var("MODERATION_NODE_URL");
+
+        assert_eq!(outcome, ModerationOutcome::Cleared);
+        let reqs = node.requests();
+        assert!(
+            reqs.len() >= 2,
+            "76 x 300 KB went out as {} POST(s)",
+            reqs.len()
+        );
+        let mut total = 0usize;
+        for r in &reqs {
+            assert!(
+                r.len() < 20 * 1024 * 1024,
+                "a POST body of {} bytes is over the cap",
+                r.len()
+            );
+            let v: serde_json::Value = serde_json::from_str(r).expect("each batch is valid JSON");
+            total += v["keyframes_png_base64"].as_array().unwrap().len();
+        }
+        assert_eq!(total, 76, "every keyframe sent exactly once");
     }
 
     // ── WP-T Sub-phase 2.2: never POST an empty keyframe set (Q5) ──────────
