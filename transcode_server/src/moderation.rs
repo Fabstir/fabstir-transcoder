@@ -895,7 +895,7 @@ fn reason_from_response(body: &str) -> Option<String> {
 }
 
 /// Real seam-#1 client. POSTs keyframes to the node over the existing blocking
-/// `reqwest 0.9` inside `spawn_blocking`. ANY failure (missing URL, body build,
+/// the blocking `reqwest` client inside `spawn_blocking`. ANY failure (missing URL, body build,
 /// client build, transport/timeout, non-2xx, parse, `JoinError`) ⇒ `Unavailable`
 /// ⇒ HOLD. Never panics, never fail-open.
 pub struct HttpModerationClient;
@@ -947,7 +947,7 @@ impl ModerationClient for HttpModerationClient {
         let frames: Vec<Vec<u8>> = keyframes.to_vec();
         let token = ingest_token();
         let join = tokio::task::spawn_blocking(move || {
-            let client = match reqwest::Client::builder()
+            let client = match reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(timeout))
                 .build()
             {
@@ -975,7 +975,7 @@ impl ModerationClient for HttpModerationClient {
                         Ok(b) => b,
                         Err(_) => return ModerationOutcome::Unavailable,
                     };
-                let mut resp = match client
+                let resp = match client
                     .post(&format!("{}/v1/moderate/frames", url))
                     .json(&body)
                     .send()

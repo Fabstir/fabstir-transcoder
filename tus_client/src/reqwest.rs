@@ -5,7 +5,7 @@ use reqwest::Method;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-impl HttpHandler for reqwest::Client {
+impl HttpHandler for reqwest::blocking::Client {
     fn handle_request(&self, req: HttpRequest) -> Result<HttpResponse, Error> {
         let mut headers = HeaderMap::new();
         for (key, value) in req.headers {

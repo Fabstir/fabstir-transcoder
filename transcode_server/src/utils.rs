@@ -78,18 +78,27 @@ pub fn hash_bytes_to_cid(hash: Vec<u8>, file_size: u64) -> Vec<u8> {
 pub async fn download_video(url: &str, file_path: &str) -> Result<(), Status> {
     println!(" {}", url);
 
-    match download_file(url, file_path) {
-        Ok(()) => println!("File downloaded successfully"),
-        Err(e) => {
-            eprintln!("Error downloading file: {}", e);
-            return Err(Status::new(
-                Code::Internal,
-                format!("Error downloading file: {}", e),
-            ));
-        }
-    }
+    // The HTTP client is blocking, so keep it off the async workers: it would stall
+    // every other task on the worker, and it panics there in debug builds.
+    let (task_url, task_path) = (url.to_owned(), file_path.to_owned());
+    let result = tokio::task::spawn_blocking(move || {
+        download_file(&task_url, &task_path).map_err(|e| e.to_string())
+    })
+    .await;
 
-    Ok(())
+    let message = match result {
+        Ok(Ok(())) => {
+            println!("File downloaded successfully");
+            return Ok(());
+        }
+        Ok(Err(e)) => e,
+        Err(e) => e.to_string(),
+    };
+    eprintln!("Error downloading file: {}", message);
+    Err(Status::new(
+        Code::Internal,
+        format!("Error downloading file: {}", message),
+    ))
 }
 
 pub async fn download_and_concat_files(
