@@ -164,7 +164,7 @@ For example JavaScript code that uses the transcoder, go [here](https://github.c
 |-------|------|-------------|
 | `id` | u32 | Unique format identifier (required) |
 | `ext` | String | Output file extension, e.g. "mp4", "opus", "flac" (required) |
-| `vcodec` | Option\<String\> | Video codec: `av1_nvenc`, `libx264`, `libx265` |
+| `vcodec` | Option\<String\> | Video codec: `av1_nvenc`, `libx264` |
 | `acodec` | Option\<String\> | Audio codec: `libopus`, `flac`, `aac` |
 | `preset` | Option\<String\> | Encoding preset, e.g. "medium", "slower" |
 | `profile` | Option\<String\> | Encoding profile, e.g. "main", "high" |

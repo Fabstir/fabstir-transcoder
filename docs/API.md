@@ -421,7 +421,7 @@ The transcoder caches downloaded source files and transcoded outputs on disk. A 
 | `label` | string | No | Human-readable label (e.g., "1080p", "720p", "129k") |
 | `type` | string | No | MIME type (e.g., "video/mp4", "audio/opus", "audio/flac") |
 | `ext` | string | Yes | Output file extension (e.g., "mp4", "opus", "flac") |
-| `vcodec` | string | No | Video codec. Required for video. Options: `av1_nvenc`, `libx264`, `libx265` |
+| `vcodec` | string | No | Video codec. Required for video. Options: `av1_nvenc`, `libx264` |
 | `acodec` | string | No | Audio codec. Options: `libopus`, `flac`, `aac` |
 | `preset` | string | No | Encoding preset (e.g., "medium", "slower") |
 | `profile` | string | No | Encoding profile (e.g., "main", "high") |
@@ -650,25 +650,48 @@ Configure the transcoder via a `.env` file in the `transcode_server/` directory.
 | `PINATA_API_SECRET` | Pinata IPFS API secret | (none) |
 | `PINATA_JWT` | Pinata IPFS JWT token | (none) |
 
-### Content Moderation (A4 fail-closed gate)
+### Content Moderation
 
-These configure the transcoder's half of the CSAM hash-match publish gate. The gate is
-**dark by default** (`MODERATION_ENABLED` unset/`false` ⇒ no keyframe tap, no POST, uploads
-exactly as before). When enabled, no output is uploaded to S5 until the node returns a
-`cleared` verdict; node unreachable / error / timeout / non-2xx ⇒ **HOLD** (upload nothing).
+Moderation has two independent switches, and every combination is supported:
 
-> **HARD RULE — dual-enforcement coupling.** The gate is only fully live when **both**
-> `MODERATION_ENABLED` (transcoder) and `MODERATION_ENFORCE` (node) are ON. Flip them
-> **together**: transcoder-ON/node-OFF can still bill a held job; transcoder-OFF/node-ON
-> lets bytes leave before a verdict.
+- **`MODERATION_GATE`** is the publish gate. It sends sampled keyframes to the node and **can hold a job**.
+- **`MODERATION_ENABLED`** turns on a shadow scan by the moderation sidecar. It **never blocks or delays a job**, and it needs that sidecar deployed.
+
+While the gate is `dark` or `enforce`, the shadow scan still runs, but its verdict is not sent to the node, so the gate's result is the only one the node records.
+
+#### Publish gate
+
+| `MODERATION_GATE` | Behaviour |
+|---|---|
+| `off` (default) | No keyframe tap, no POST, no hold. |
+| `dark` | Taps keyframes, POSTs them and records the verdict, logs `MODERATION WOULD-HOLD` if it would have held, and **publishes anyway**. |
+| `enforce` | Publishes only if every batch returns `cleared`. Anything else holds the job, including an unreachable node, a timeout or a non-2xx response. |
+
+Any other value stops the server at startup, with an error naming the bad value and the valid set.
+
+- **Held jobs:** nothing is uploaded, and `GetTranscoded` returns `status_code` 200, `metadata` `[]` and `progress` 100.
+- **Batching:** keyframes are sent in sequential batches of at most 200 keyframes or 12 MiB of raw PNG, whichever comes first, to stay under the node's 20 MiB request limit. Every batch carries the same `taskId` and `sourceSha256`, and the first batch that isn't `cleared` stops the run.
+- **Rollout:** the gate uses the same `off` → `dark` → `enforce` steps as the node and SDK gates. Do not set `enforce` until the node can return `cleared` for this content, or every job will hold.
 
 | Variable | Description | Default |
 |---|---|---|
-| `MODERATION_ENABLED` | Master switch for the A4 gate. `false` = dark-launch (byte-identical to today). | `false` |
-| `MODERATION_NODE_URL` | Base URL of the node's `POST /v1/moderate/frames`. Missing ⇒ HOLD. | (none) |
-| `MODERATION_TIMEOUT_SECS` | Seam-#1 POST timeout (seconds). On expiry ⇒ HOLD. | `30` |
-| `MODERATION_SAMPLE_INTERVAL_SECS` | Keyframe sampling floor interval (seconds); even full-duration sampling widens this to fit the budget. | `2.0` |
-| `MODERATION_KEYFRAME_MAX` | Keyframe budget. Drives even full-duration sampling (the interval widens to fit), and is also emitted as a hard `-frames:v` backstop that bounds frame production if the duration probe fails — it never truncates a correctly-probed source. | `300` |
+| `MODERATION_GATE` | Publish gate mode: `off`, `dark` or `enforce`. | `off` |
+| `MODERATION_NODE_URL` | Node base URL for `POST /v1/moderate/frames`. Unset while the gate is armed ⇒ every job holds. | (none) |
+| `MODERATION_INGEST_TOKEN` | Shared secret sent as the `ingestToken` body field. Unset or wrong ⇒ the node returns 401 and every job holds. | (none) |
+| `MODERATION_FRAMES_TIMEOUT_SECS` | Deadline for each frames POST, per batch (seconds). | `30` |
+| `MODERATION_SAMPLE_INTERVAL_SECS` | Shortest interval between sampled keyframes (seconds). | `2.0` |
+| `MODERATION_MAX_INTERVAL_SECS` | Longest interval between sampled keyframes (seconds). Raised to the shortest interval if set below it. | `12.0` |
+| `MODERATION_KEYFRAME_MAX` | Keyframe budget. Widens the sampling interval on long content and never truncates a source whose duration was probed. Above about 3 h 20 m the longest interval wins, and the count exceeds the budget. | `1000` |
+
+#### Shadow scan
+
+| Variable | Description | Default |
+|---|---|---|
+| `MODERATION_ENABLED` | Starts a detached sidecar scan for each job. Fails open: it never affects the job. | `false` |
+| `MODERATION_SOCKET_PATH` | Path to the sidecar's Unix socket. Unset while enabled ⇒ one config-fault log per job, and the job continues. | (none) |
+| `MODERATION_SIDECAR_SOURCE_ROOT` | The sidecar's mount point for the source directory, used only to translate paths. | `/sources` |
+| `MODERATION_TIMEOUT_SECS` | Deadline for each sidecar call (seconds), starting once the call leaves the queue. | `10800` |
+| `MODERATION_MAX_PENDING` | Maximum queued and in-flight scans. Beyond this, scans are skipped with an alert log, and the job continues. | `8` |
 
 ---
 
@@ -676,7 +699,7 @@ exactly as before). When enabled, no output is uploaded to S5 until the node ret
 
 ### Docker Image
 
-Pre-built images are published to Vultr Container Registry on every push to `main`:
+Images are built and pushed to Vultr Container Registry by hand. No CI job publishes them, so pushing to `main` does not build or deploy anything:
 
 ```
 ewr.vultrcr.com/fabstir/transcoder:{git-sha}
