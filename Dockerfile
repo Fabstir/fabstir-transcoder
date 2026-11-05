@@ -3,7 +3,7 @@ FROM nvidia/cuda:12.8.0-devel-ubuntu22.04 AS ffmpeg-build
 
 RUN apt-get update && \
   apt-get install -y build-essential pkg-config nasm yasm git wget xz-utils \
-  libx264-dev libopus-dev && \
+  libx264-dev libopus-dev zlib1g-dev && \
   apt-get clean && \
   rm -rf /var/lib/apt/lists/*
 
@@ -13,7 +13,10 @@ RUN git clone --branch n13.0.19.0 --depth 1 https://git.videolan.org/git/ffmpeg/
   make install && \
   cd .. && rm -rf nv-codec-headers
 
-# Download, configure, and build FFmpeg 7.0.2
+# Download, configure, and build FFmpeg 8.0
+# --enable-zlib is load-bearing: the moderation tap writes PNG keyframes on every
+# job, and FFmpeg's PNG encoder needs zlib. Left to autodetection, missing headers
+# silently drop the encoder; stated explicitly, configure fails the build instead.
 RUN wget -q https://ffmpeg.org/releases/ffmpeg-8.0.tar.xz && \
   tar xf ffmpeg-8.0.tar.xz && \
   cd ffmpeg-8.0 && \
@@ -23,6 +26,7 @@ RUN wget -q https://ffmpeg.org/releases/ffmpeg-8.0.tar.xz && \
     --enable-nonfree \
     --enable-libx264 \
     --enable-libopus \
+    --enable-zlib \
     --enable-cuda-nvcc \
     --enable-libnpp \
     --extra-cflags="-I/usr/local/cuda/include" \
@@ -73,7 +77,7 @@ WORKDIR /usr/local/bin
 
 RUN apt-get update && \
   apt-get install -y openssl ca-certificates curl libnuma1 \
-  libx264-163 libopus0 libnpp-12-8 && \
+  libx264-163 libopus0 libnpp-12-8 zlib1g && \
   apt-get clean && \
   rm -rf /var/lib/apt/lists/*
 
@@ -86,6 +90,22 @@ RUN ldconfig
 
 # Set library paths (replaces install-script.sh which wrote to ~/.profile)
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/cuda/lib64"
+
+# Fail the build, not every job at runtime, if this FFmpeg cannot do what the
+# server asks of it. The second half runs the moderation tap's filtergraph (see
+# append_tap_pre/append_tap_post) with a software encoder. There is no GPU at
+# build time, so NVENC is only checked as present; it still needs a real job.
+RUN for enc in png libx264 libopus flac aac h264_nvenc av1_nvenc; do \
+      ffmpeg -hide_banner -encoders | grep -qE "^ [VA].{5} $enc " \
+        || { echo "FFmpeg is missing encoder: $enc"; exit 1; }; \
+    done && \
+    mkdir -p /tmp/modtap && \
+    ffmpeg -hide_banner -v error -f lavfi -i testsrc2=s=1280x720:r=2:d=4 \
+      -filter_complex "[0:v]split=2[m][t];[t]fps=0.5,scale='min(512,iw)':-2[k]" \
+      -map "[m]" -c:v libx264 -y /tmp/modtap/main.mp4 \
+      -map "[k]" -fps_mode vfr -frames:v 5 /tmp/modtap/kf_%05d.png && \
+    test -s /tmp/modtap/kf_00001.png && \
+    rm -rf /tmp/modtap
 
 # Copy the root CA certificate to the container
 RUN echo "$S5_ROOT_CA" > /usr/local/share/ca-certificates/s5-root-ca.crt \
