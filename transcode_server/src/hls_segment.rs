@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::fs;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::encrypt_file::encrypt_file_xchacha20;
 use crate::encrypted_cid::create_encrypted_cid;
@@ -51,15 +52,21 @@ pub fn parse_hls_playlist(path: &str) -> Result<PlaylistParseResult> {
                 }
             }
         } else if line.starts_with("#EXTINF:") {
+            // "#EXTINF:<duration>,[<title>]"
             let dur_str = line.trim_start_matches("#EXTINF:");
-            let dur_str = dur_str.trim_end_matches(',');
-            if let Ok(dur) = dur_str.parse::<f64>() {
-                pending_duration = Some(dur);
-            }
+            let dur_str = dur_str.split(',').next().unwrap_or_default();
+            let dur = dur_str
+                .parse::<f64>()
+                .ok()
+                .filter(|dur| dur.is_finite())
+                .ok_or_else(|| anyhow!("Unreadable segment duration in playlist: {}", line))?;
+            pending_duration = Some(dur);
         } else if !line.starts_with('#') && !line.is_empty() {
-            if let Some(dur) = pending_duration.take() {
-                segments.push((line.to_string(), dur));
-            }
+            // Skipping one would publish video with a hole in it.
+            let dur = pending_duration
+                .take()
+                .ok_or_else(|| anyhow!("Segment with no duration in playlist: {}", line))?;
+            segments.push((line.to_string(), dur));
         }
     }
 
@@ -169,9 +176,11 @@ pub async fn process_hls_segments(
         .map_err(|e| anyhow!("Init segment upload failed: {}", e))?;
     let init_segment_cid = prefix_cid(&init_cid, &dest);
 
-    // Parallel segment uploads with semaphore
+    // Parallel segment uploads with semaphore. The set aborts whatever is still
+    // running when it is dropped, so a failure, or the job being stopped, ends the
+    // lot instead of leaving uploads running with no one to read their results.
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS));
-    let mut handles = Vec::new();
+    let mut uploads = JoinSet::new();
 
     for (i, (filename, duration)) in parsed.segments.iter().enumerate() {
         let sem = Arc::clone(&semaphore);
@@ -181,8 +190,11 @@ pub async fn process_hls_segments(
         let dur = *duration;
         let idx = i as u32;
 
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+        uploads.spawn(async move {
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|e| anyhow!("Upload slots closed: {}", e))?;
             let result = upload_single_segment(&seg_path, idx, should_encrypt, dest_clone).await;
             result.map(|(cid, encrypted)| HlsSegmentInfo {
                 index: idx,
@@ -191,18 +203,17 @@ pub async fn process_hls_segments(
                 encrypted,
             })
         });
-        handles.push(handle);
     }
 
     // Collect results
     let mut segments: Vec<HlsSegmentInfo> = Vec::new();
-    let total = handles.len();
-    for (done, handle) in handles.into_iter().enumerate() {
-        let info = handle
-            .await
-            .map_err(|e| anyhow!("Segment task failed: {}", e))??;
+    let total = parsed.segments.len();
+    let mut done = 0;
+    while let Some(finished) = uploads.join_next().await {
+        let info = finished.map_err(|e| anyhow!("Segment task failed: {}", e))??;
         segments.push(info);
-        let progress = 70 + ((done + 1) * 30 / total) as i32;
+        done += 1;
+        let progress = 70 + (done * 30 / total) as i32;
         shared::update_progress(task_id, format_index, progress);
     }
 
@@ -284,6 +295,77 @@ seg_0001.m4s
         );
         let result = parse_hls_playlist(path.to_str().unwrap()).unwrap();
         assert!((result.segments[1].1 - 3.5).abs() < 0.001);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn parse_playlist_text(name: &str, text: &str) -> Result<PlaylistParseResult> {
+        let dir = std::env::temp_dir().join(format!("hls_test_{}_{}", name, uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("playlist.m3u8");
+        write_test_playlist(path.to_str().unwrap(), text);
+        let result = parse_hls_playlist(path.to_str().unwrap());
+        fs::remove_dir_all(&dir).ok();
+        result
+    }
+
+    #[test]
+    fn test_a_segment_title_after_the_duration_is_fine() {
+        let parsed = parse_playlist_text(
+            "title",
+            "#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.0,a title\nseg_0000.m4s\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.segments, [("seg_0000.m4s".to_string(), 6.0)]);
+    }
+
+    /// Dropping the segment and carrying on published video with a hole in it,
+    /// reported as a success.
+    #[test]
+    fn test_a_segment_with_an_unreadable_duration_is_an_error_not_a_gap() {
+        for playlist in [
+            "#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:nan,\nseg_0000.m4s\n",
+            "#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.0,\nseg_0000.m4s\n#EXTINF:bad,\nseg_0001.m4s\n",
+            "#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.0,\nseg_0000.m4s\nseg_0001.m4s\n",
+        ] {
+            assert!(
+                parse_playlist_text("gap", playlist).is_err(),
+                "{}",
+                playlist
+            );
+        }
+    }
+
+    /// One failed segment fails the format, and the other uploads must stop with it.
+    #[tokio::test]
+    async fn test_a_failed_segment_stops_the_other_uploads() {
+        let portal = crate::test_support::portal();
+        let _uploads = crate::test_support::UPLOAD_TEST_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!("hls_test_stop_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("init.mp4"), b"init").unwrap();
+        // The second segment doesn't exist, so it fails as soon as it is reached.
+        let mut playlist = String::from("#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:1.0,\nmissing.m4s\n");
+        for i in 0..200 {
+            let name = format!("seg_{:04}.m4s", i);
+            fs::write(dir.join(&name), vec![1u8; 1024]).unwrap();
+            playlist.push_str(&format!("#EXTINF:1.0,\n{}\n", name));
+        }
+        fs::write(dir.join("playlist.m3u8"), playlist).unwrap();
+        let before = portal.uploads().len();
+
+        let result = process_hls_segments("task", 0, dir.to_str().unwrap(), 100, None).await;
+
+        assert!(result.is_err());
+        // Whatever was already running gets to finish. Settle, then count.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let started = portal.uploads().len() - before;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            portal.uploads().len() - before,
+            started,
+            "uploads kept starting"
+        );
+        assert!(started < 100, "{} uploads ran after the failure", started);
         fs::remove_dir_all(&dir).ok();
     }
 

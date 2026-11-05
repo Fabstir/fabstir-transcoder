@@ -66,10 +66,20 @@ impl<'a> Client<'a> {
 
         let response = self.http_handler.deref().handle_request(req)?;
 
-        let bytes_uploaded = match response.headers.get_by_key(headers::UPLOAD_OFFSET) {
-            Some(val) => val.parse::<usize>()?,
-            None => return Err(Error::NotFoundError),
-        };
+        // The status first: only this can tell an upload that's gone from a server
+        // that's having a bad moment, and the answer to each is very different.
+        if response.status_code == 404 || response.status_code == 410 {
+            return Err(Error::NotFoundError);
+        }
+        if !(200..300).contains(&response.status_code) {
+            return Err(Error::UnexpectedStatusCode(response.status_code));
+        }
+
+        let bytes_uploaded = response
+            .headers
+            .get_by_key(headers::UPLOAD_OFFSET)
+            .ok_or_else(|| Error::MissingHeader(headers::UPLOAD_OFFSET.to_owned()))?
+            .parse::<usize>()?;
 
         let total_size = response
             .headers
@@ -92,10 +102,6 @@ impl<'a> Client<'a> {
                     })
                     .collect::<HashMap<String, String>>()
             });
-
-        if response.status_code.to_string().starts_with('4') {
-            return Err(Error::NotFoundError);
-        }
 
         Ok(UploadInfo {
             bytes_uploaded,
@@ -149,10 +155,12 @@ impl<'a> Client<'a> {
         let mut buffer = vec![0; chunk_size];
         let mut progress = info.bytes_uploaded;
 
-        reader.seek(SeekFrom::Start(progress as u64))?;
-
         let mut chunk_index = 0;
-        loop {
+        // Checked first: resuming can find that the server already has it all.
+        while progress < file_len as usize {
+            // From the offset the server reports, which can be short of what was sent.
+            reader.seek(SeekFrom::Start(progress as u64))?;
+
             let bytes_read = reader.read(&mut buffer)?;
             if bytes_read == 0 {
                 return Err(Error::FileReadError);
@@ -173,7 +181,7 @@ impl<'a> Client<'a> {
                 return Err(Error::WrongUploadOffsetError);
             }
 
-            if response.status_code == 404 {
+            if response.status_code == 404 || response.status_code == 410 {
                 return Err(Error::NotFoundError);
             }
 
@@ -186,11 +194,13 @@ impl<'a> Client<'a> {
                 None => Err(Error::MissingHeader(headers::UPLOAD_OFFSET.to_owned())),
             }?;
 
-            progress = upload_offset.parse()?;
+            let new_progress = upload_offset.parse()?;
 
-            if progress >= file_len as usize {
-                break;
+            // Without this a server that accepts nothing would keep this loop going.
+            if new_progress <= progress {
+                return Err(Error::WrongUploadOffsetError);
             }
+            progress = new_progress;
 
             chunk_index += 1;
         }
@@ -298,7 +308,7 @@ impl<'a> Client<'a> {
             .get_by_key(headers::LOCATION)
             .ok_or_else(|| Error::MissingHeader(headers::LOCATION.to_owned()))?;
 
-        Ok(location.to_owned())
+        Ok(resolve_location(url, location))
     }
 
     /// Delete a file on the server.
@@ -487,6 +497,18 @@ impl HeaderMap for HashMap<String, String> {
     }
 }
 
+/// The tus specification allows a server to send a path as the location of an upload.
+fn resolve_location(request_url: &str, location: &str) -> String {
+    if !location.starts_with('/') {
+        return location.to_owned();
+    }
+    let host_start = request_url.find("://").map_or(0, |i| i + 3);
+    let host_end = request_url[host_start..]
+        .find('/')
+        .map_or(request_url.len(), |i| host_start + i);
+    format!("{}{}", &request_url[..host_end], location)
+}
+
 /// Creates HTTP headers for an upload request, including the current progress.
 ///
 /// # Arguments
@@ -504,4 +526,162 @@ fn create_upload_headers(progress: usize) -> Headers {
     );
     headers.insert(headers::UPLOAD_OFFSET.to_owned(), progress.to_string());
     headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::HttpResponse;
+    use std::cell::RefCell;
+    use std::io::Write;
+
+    /// Answers from a script and records what it was sent.
+    #[derive(Default)]
+    struct Scripted {
+        replies: RefCell<Vec<HttpResponse>>,
+        sent: RefCell<Vec<(usize, Vec<u8>)>>,
+    }
+
+    fn reply(status_code: usize, headers: &[(&str, &str)]) -> HttpResponse {
+        HttpResponse {
+            status_code,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    impl HttpHandler for &Scripted {
+        fn handle_request(&self, req: HttpRequest) -> Result<HttpResponse, Error> {
+            if let Some(body) = req.body {
+                let offset = req.headers[headers::UPLOAD_OFFSET].parse().unwrap();
+                self.sent.borrow_mut().push((offset, body.to_vec()));
+            }
+            Ok(self.replies.borrow_mut().remove(0))
+        }
+    }
+
+    fn temp_file(content: &[u8]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(content).unwrap();
+        file
+    }
+
+    /// Reached when a retry finds the first attempt had in fact got everything there.
+    #[test]
+    fn test_an_upload_the_server_already_has_all_of_is_finished() {
+        let script = Scripted::default();
+        script.replies.borrow_mut().push(reply(
+            200,
+            &[("upload-offset", "5"), ("upload-length", "5")],
+        ));
+        let file = temp_file(b"12345");
+        Client::new(&script)
+            .upload_with_chunk_size("http://x/1", file.path(), 2)
+            .unwrap();
+        assert!(script.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_an_empty_file_is_finished_as_soon_as_it_is_created() {
+        let script = Scripted::default();
+        script.replies.borrow_mut().push(reply(
+            200,
+            &[("upload-offset", "0"), ("upload-length", "0")],
+        ));
+        let file = temp_file(b"");
+        Client::new(&script)
+            .upload_with_chunk_size("http://x/1", file.path(), 2)
+            .unwrap();
+        assert!(script.sent.borrow().is_empty());
+    }
+
+    /// The next chunk must start where the server says it got to.
+    #[test]
+    fn test_chunks_follow_the_offset_the_server_reports() {
+        let script = Scripted::default();
+        *script.replies.borrow_mut() = vec![
+            reply(200, &[("upload-offset", "0"), ("upload-length", "6")]),
+            // Sent 4 bytes, and the server only kept 1.
+            reply(204, &[("upload-offset", "1")]),
+            reply(204, &[("upload-offset", "5")]),
+            reply(204, &[("upload-offset", "6")]),
+        ];
+        let file = temp_file(b"abcdef");
+        Client::new(&script)
+            .upload_with_chunk_size("http://x/1", file.path(), 4)
+            .unwrap();
+        assert_eq!(
+            *script.sent.borrow(),
+            [
+                (0, b"abcd".to_vec()),
+                (1, b"bcde".to_vec()),
+                (5, b"f".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_a_chunk_that_gets_nowhere_is_an_error_not_an_endless_loop() {
+        let script = Scripted::default();
+        *script.replies.borrow_mut() = vec![
+            reply(200, &[("upload-offset", "2"), ("upload-length", "4")]),
+            reply(204, &[("upload-offset", "2")]),
+        ];
+        let file = temp_file(b"abcd");
+        let result = Client::new(&script).upload_with_chunk_size("http://x/1", file.path(), 4);
+        assert!(matches!(result, Err(Error::WrongUploadOffsetError)));
+    }
+
+    /// Only a 404 means the server has lost it. A 503 asks to try again, and
+    /// treating it as lost would throw away everything uploaded so far.
+    #[test]
+    fn test_get_info_tells_an_outage_from_a_missing_upload() {
+        for (status, is_not_found) in [(404, true), (410, true), (503, false), (401, false)] {
+            let script = Scripted::default();
+            script.replies.borrow_mut().push(reply(status, &[]));
+            let error = Client::new(&script).get_info("http://x/1").unwrap_err();
+            assert_eq!(
+                matches!(error, Error::NotFoundError),
+                is_not_found,
+                "status {}",
+                status
+            );
+            assert_eq!(
+                matches!(error, Error::UnexpectedStatusCode(_)),
+                !is_not_found,
+                "status {}",
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_info_without_an_offset_is_a_missing_header() {
+        let script = Scripted::default();
+        script.replies.borrow_mut().push(reply(200, &[]));
+        let error = Client::new(&script).get_info("http://x/1").unwrap_err();
+        assert!(matches!(error, Error::MissingHeader(_)));
+    }
+
+    /// A relative location is allowed by the tus specification.
+    #[test]
+    fn test_a_relative_location_is_resolved_against_the_server() {
+        for (location, expected) in [
+            ("/files/abc", "https://host:8080/files/abc"),
+            ("https://other/files/abc", "https://other/files/abc"),
+        ] {
+            let script = Scripted::default();
+            script
+                .replies
+                .borrow_mut()
+                .push(reply(201, &[("location", location)]));
+            let file = temp_file(b"x");
+            let url = Client::new(&script)
+                .create("https://host:8080/s5/upload/tus", file.path())
+                .unwrap();
+            assert_eq!(url, expected);
+        }
+    }
 }

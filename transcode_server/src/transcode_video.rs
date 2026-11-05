@@ -1,28 +1,20 @@
 use crate::moderation;
-use crate::shared;
+use crate::shared::{self, LocalFile};
 
 use crate::encrypt_file::encrypt_file_xchacha20;
 use crate::encrypted_cid::create_encrypted_cid;
 use crate::s5::hash_blake3_file;
 use crate::s5::upload_video;
-use crate::utils::{
-    base64url_to_bytes, bytes_to_base64url, download_and_concat_files, download_video,
-    hash_bytes_to_cid,
-};
-use base64::{engine::general_purpose, DecodeError, Engine as _};
+use crate::utils::{bytes_to_base64url, hash_bytes_to_cid};
 use dotenv::var;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use sanitize_filename::sanitize;
 use serde::Deserialize;
-use serde_json;
-use std::error::Error;
-use std::fs::metadata;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use tokio::io::AsyncReadExt;
-use tonic::{transport::Server, Code, Request, Response, Status};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+use tokio::io::AsyncBufReadExt;
+use tonic::{Code, Response, Status};
 
 // NOTE (WP-T Task 1.2.4): this module's own `PATH_TO_FILE` static was deleted
 // rather than un-quarantined. It had no user even at 310c30a when the A1 tap was
@@ -35,10 +27,6 @@ static PATH_TO_TRANSCODED_FILE: Lazy<String> = Lazy::new(|| {
     var("PATH_TO_TRANSCODED_FILE")
         .unwrap_or_else(|_| panic!("PATH_TO_TRANSCODED_FILE not set in .env"))
 });
-
-pub mod transcode {
-    tonic::include_proto!("transcode");
-}
 
 #[derive(Debug, Clone)]
 pub struct TranscodeVideoResponse {
@@ -142,6 +130,37 @@ pub fn get_video_format_from_str(video_format: &str) -> Result<VideoFormat, Stat
     })
 }
 
+/// Runs one of the short ffprobe calls, which are never meant to take long.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long to wait for a child to go after killing it. One stuck inside a driver
+/// can't even be killed, and the queue has to move on regardless.
+const KILL_WAIT: Duration = Duration::from_secs(30);
+
+const DEFAULT_STALL_LIMIT: Duration = Duration::from_secs(15 * 60);
+
+async fn run_probe(cmd: Command, limit: Duration) -> Result<std::process::Output, String> {
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.stdin(Stdio::null()).kill_on_drop(true);
+    match tokio::time::timeout(limit, cmd.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(format!("could not run: {}", e)),
+        Err(_) => Err(format!("timed out after {:?}", limit)),
+    }
+}
+
+fn parse_duration(stdout: &[u8]) -> Result<f64, String> {
+    let duration: f64 = String::from_utf8_lossy(stdout)
+        .trim()
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    if duration.is_finite() && duration >= 0.0 {
+        Ok(duration)
+    } else {
+        Err(format!("unusable duration: {}", duration))
+    }
+}
+
 /// Gets video duration in seconds using `ffprobe`.
 ///
 /// # Arguments
@@ -150,29 +169,34 @@ pub fn get_video_format_from_str(video_format: &str) -> Result<VideoFormat, Stat
 /// # Returns:
 /// `Result<f64, String>` - Duration in seconds or error message.
 ///
-fn get_video_duration(file_path: &str) -> Result<f64, String> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            file_path,
-        ])
-        .output()
-        .expect("failed to execute ffprobe");
+pub async fn get_video_duration(file_path: &str) -> Result<f64, String> {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        file_path,
+    ]);
+    let output = run_probe(cmd, PROBE_TIMEOUT).await?;
 
     if output.status.success() {
-        let duration_str = String::from_utf8(output.stdout).unwrap();
-        duration_str
-            .trim()
-            .parse::<f64>()
-            .map_err(|e| e.to_string())
+        parse_duration(&output.stdout)
     } else {
         Err(String::from("Failed to retrieve video duration"))
     }
+}
+
+/// Reads FFmpeg's media clock from a line of its output, in seconds: `out_time=` from
+/// `-progress`, or `time=` from a status report.
+fn parse_media_time(line: &str) -> Option<f64> {
+    static TIME: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"time=(\d+):(\d+):(\d+\.\d+)").expect("a valid regex"));
+    let caps = TIME.captures(line)?;
+    let number = |i: usize| caps.get(i)?.as_str().parse::<f64>().ok();
+    Some(number(1)? * 3600.0 + number(2)? * 60.0 + number(3)?)
 }
 
 /// Parses ffmpeg progress output to calculate and return the transcoding progress as a percentage.
@@ -192,22 +216,150 @@ fn parse_progress(line: &str, total_duration: f64) -> Option<i32> {
     if total_duration <= 0.0 {
         return Some(0); // Prevent division by zero
     }
+    let current_time_seconds = parse_media_time(line)?;
+    Some(((current_time_seconds / total_duration) * 100.0).round() as i32)
+}
 
-    let re = Regex::new(r"time=(\d+):(\d+):(\d+\.\d+)").unwrap();
-    if let Some(caps) = re.captures(line) {
-        let hours = caps.get(1).unwrap().as_str().parse::<f64>().unwrap_or(0.0);
-        let minutes = caps.get(2).unwrap().as_str().parse::<f64>().unwrap_or(0.0);
-        let seconds = caps.get(3).unwrap().as_str().parse::<f64>().unwrap_or(0.0);
-        let current_time_seconds = hours * 3600.0 + minutes * 60.0 + seconds;
-        let progress = ((current_time_seconds / total_duration) * 100.0).round() as i32;
-        return Some(progress);
+/// The `key=value` lines `-progress` and the status reports print every second or
+/// so. Worth reading for the clock, but too many to log for hours on end.
+fn is_progress_line(line: &str) -> bool {
+    static PROGRESS: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^\s*[a-z0-9_]+=").expect("a valid regex"));
+    PROGRESS.is_match(line)
+}
+
+/// `FFMPEG_STALL_TIMEOUT_SECS`, where 0 turns the watchdog off.
+fn stall_limit_from(setting: Option<&str>) -> Option<Duration> {
+    match setting.map(|value| value.trim().parse::<u64>()) {
+        Some(Ok(0)) => None,
+        Some(Ok(seconds)) => Some(Duration::from_secs(seconds)),
+        Some(Err(_)) => {
+            eprintln!("FFMPEG_STALL_TIMEOUT_SECS is not a number; using the default");
+            Some(DEFAULT_STALL_LIMIT)
+        }
+        None => Some(DEFAULT_STALL_LIMIT),
+    }
+}
+
+fn ffmpeg_stall_limit() -> Option<Duration> {
+    stall_limit_from(var("FFMPEG_STALL_TIMEOUT_SECS").ok().as_deref())
+}
+
+/// Decides whether a child has stopped getting anywhere. Only its media clock moving
+/// forward counts: FFmpeg 7 and later keep printing status reports while stuck.
+struct StallWatch {
+    limit: Option<Duration>,
+    latest_time: f64,
+    last_advance: Instant,
+}
+
+impl StallWatch {
+    fn new(limit: Option<Duration>, now: Instant) -> Self {
+        StallWatch {
+            limit,
+            latest_time: f64::NEG_INFINITY,
+            last_advance: now,
+        }
     }
 
-    None
+    fn observe(&mut self, media_time: f64, now: Instant) {
+        if media_time > self.latest_time {
+            self.latest_time = media_time;
+            self.last_advance = now;
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.limit.map(|limit| self.last_advance + limit)
+    }
+}
+
+/// Waits for something the child is doing, up to the watchdog's deadline. `None`
+/// means the deadline came first.
+async fn until_deadline<F: std::future::Future>(
+    deadline: Option<Instant>,
+    work: F,
+) -> Option<F::Output> {
+    match deadline {
+        Some(at) => tokio::time::timeout_at(at.into(), work).await.ok(),
+        None => Some(work.await),
+    }
+}
+
+async fn kill_stalled_child(mut child: tokio::process::Child, limit: Option<Duration>) -> String {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(KILL_WAIT, child.wait()).await;
+    format!("FFmpeg stalled: no progress for {:?}, killed it", limit)
+}
+
+/// Runs FFmpeg without tying up an async worker, passing each line of its output to
+/// `on_line`. Kills it if it stops making progress for `stall_limit`, or if this
+/// future is dropped, which is how a job past its deadline gets stopped.
+async fn run_ffmpeg_child(
+    cmd: Command,
+    stall_limit: Option<Duration>,
+    mut on_line: impl FnMut(&str),
+) -> Result<ExitStatus, String> {
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| format!("ffmpeg spawn: {}", e))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "ffmpeg has no stderr".to_string())?;
+    let mut reader = tokio::io::BufReader::new(stderr);
+    let mut watch = StallWatch::new(stall_limit, Instant::now());
+
+    // Bytes rather than text, because what FFmpeg prints from a file's metadata can
+    // be anything. Kept across waits: a partial line stays here until the rest comes.
+    let mut line = Vec::new();
+    loop {
+        match until_deadline(watch.deadline(), reader.read_until(b'\n', &mut line)).await {
+            None => return Err(kill_stalled_child(child, stall_limit).await),
+            Some(Ok(0)) => break,
+            Some(Ok(_)) => {
+                let text = String::from_utf8_lossy(&line);
+                if let Some(media_time) = parse_media_time(&text) {
+                    watch.observe(media_time, Instant::now());
+                }
+                on_line(text.trim_end());
+                line.clear();
+            }
+            Some(Err(e)) => {
+                let _ = child.start_kill();
+                return Err(format!("reading ffmpeg output: {}", e));
+            }
+        }
+    }
+
+    // Its output has ended, but it can still be stuck on the way out.
+    match until_deadline(watch.deadline(), child.wait()).await {
+        None => Err(kill_stalled_child(child, stall_limit).await),
+        Some(Ok(status)) => Ok(status),
+        Some(Err(e)) => Err(format!("ffmpeg wait: {}", e)),
+    }
 }
 
 pub fn hls_output_dir(file_name: &str) -> String {
     format!("{}{}_hls", *PATH_TO_TRANSCODED_FILE, file_name)
+}
+
+/// Where FFmpeg writes a single-file output.
+fn plain_output_path(file_name: &str, ext: &str) -> String {
+    format!("{}{}_ue.{}", *PATH_TO_TRANSCODED_FILE, file_name, ext)
+}
+
+/// What a produced output occupies on disk, however it is stored.
+pub fn local_output_path(file_name: &str, ext: &str, is_hls: bool) -> String {
+    if is_hls {
+        hls_output_dir(file_name)
+    } else {
+        plain_output_path(file_name, ext)
+    }
 }
 
 // ── Moderation keyframe tap (A1) ───────────────────────────────────────────────
@@ -231,21 +383,20 @@ pub fn modtap_dir(task_id: &str) -> String {
 /// error/ambiguity returns `true` (fail-closed — a probe false-negative must never
 /// make a video source look audio-only).
 /// Revived for WP-T (IMPLEMENTATION-MODERATION-FRAMES-GATE-WPT.md).
-pub fn source_has_video(path: &str) -> bool {
-    match Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v",
-            "-show_entries",
-            "stream=codec_type",
-            "-of",
-            "csv=p=0",
-            path,
-        ])
-        .output()
-    {
+pub async fn source_has_video(path: &str) -> bool {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "csv=p=0",
+        path,
+    ]);
+    match run_probe(cmd, PROBE_TIMEOUT).await {
         // Only a CLEAN, successful probe that affirmatively reports no video stream may
         // say audio-only. A non-zero exit (I/O error, partially-corrupt container, FS
         // hiccup) leaves stdout empty under `-v error`, which must NOT read as audio-only.
@@ -261,10 +412,10 @@ pub fn source_has_video(path: &str) -> bool {
 /// video decode. Spawn/wait failures AND a non-zero exit ⇒ `Err` (never panic),
 /// so the Phase-5 gate leaves `tap_ok = false` ⇒ HOLD.
 /// Revived for WP-T (IMPLEMENTATION-MODERATION-FRAMES-GATE-WPT.md).
-pub fn tap_source_keyframes(file_path: &str, tap_dir: &str) -> Result<(), Status> {
+pub async fn tap_source_keyframes(file_path: &str, tap_dir: &str) -> Result<(), Status> {
     std::fs::create_dir_all(tap_dir)
         .map_err(|e| Status::new(Code::Internal, format!("modtap dir: {}", e)))?;
-    let d = get_video_duration(file_path).unwrap_or(0.0);
+    let d = get_video_duration(file_path).await.unwrap_or(0.0);
     let fps = format!(
         "fps={:.5},{}",
         1.0 / moderation::effective_interval(d),
@@ -272,23 +423,29 @@ pub fn tap_source_keyframes(file_path: &str, tap_dir: &str) -> Result<(), Status
     );
     let out = format!("{}/kf_%05d.png", tap_dir);
     let cap = moderation::frames_cap(d).to_string(); // duration-derived (see append_tap_post)
-    let status = Command::new("ffmpeg")
-        .args([
-            "-v",
-            "error",
-            "-i",
-            file_path,
-            "-vf",
-            fps.as_str(),
-            "-fps_mode",
-            "vfr",
-            "-frames:v",
-            cap.as_str(),
-            "-y",
-            out.as_str(),
-        ])
-        .status()
-        .map_err(|e| Status::new(Code::Internal, format!("source tap spawn: {}", e)))?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-nostdin",
+        "-v",
+        "error",
+        "-progress",
+        "pipe:2",
+        "-stats_period",
+        "1",
+        "-i",
+        file_path,
+        "-vf",
+        fps.as_str(),
+        "-fps_mode",
+        "vfr",
+        "-frames:v",
+        cap.as_str(),
+        "-y",
+        out.as_str(),
+    ]);
+    let status = run_ffmpeg_child(cmd, ffmpeg_stall_limit(), |_| {})
+        .await
+        .map_err(|e| Status::new(Code::Internal, format!("source tap: {}", e)))?;
     if !status.success() {
         return Err(Status::new(
             Code::Internal,
@@ -306,6 +463,71 @@ pub fn tap_source_keyframes(file_path: &str, tap_dir: &str) -> Result<(), Status
 /// 1.72-compatible (avoids `Option::is_none_or`, which is 1.82+).
 pub fn vf_foldable(vf: Option<&str>) -> bool {
     !matches!(vf, Some(s) if s.contains(';') || s.contains('[') || s.contains(']'))
+}
+
+/// The video filters a request may ask for. Everything else is refused, because other
+/// filters can read files from this machine (`movie`, `subtitles`, `drawtext`, ...) and
+/// put them in an output, where the moderation tap, which only reads the source,
+/// would never see them.
+const ALLOWED_VF_FILTERS: &[&str] = &[
+    "scale",
+    "scale_cuda",
+    "scale_npp",
+    "hwupload_cuda",
+    "hwdownload",
+    "format",
+    "fps",
+    "crop",
+    "pad",
+    "setsar",
+    "setdar",
+    "transpose",
+    "hflip",
+    "vflip",
+    "yadif",
+    "bwdif",
+];
+
+/// True if `vf` is a plain chain of allowed filters. A comma inside quotes belongs
+/// to an expression; quotes and commas are the only syntax allowed, so what gets
+/// checked here is what FFmpeg will see.
+fn vf_allowed(vf: &str) -> bool {
+    if vf.contains(['[', ']', ';', '\\']) {
+        return false;
+    }
+    let mut filters = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    for (i, c) in vf.char_indices() {
+        match c {
+            '\'' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                filters.push(&vf[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    filters.push(&vf[start..]);
+    !in_quotes
+        && filters.iter().all(|filter| {
+            let name = filter.split('=').next().unwrap_or_default().trim();
+            ALLOWED_VF_FILTERS.contains(&name)
+        })
+}
+
+/// Checks the parts of a format that end up in file names and filter graphs. Both
+/// come straight from the request.
+pub fn validate_format(format: &VideoFormat) -> Result<(), String> {
+    if format.ext.is_empty() || !format.ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!("unusable file extension: {:?}", format.ext));
+    }
+    if let Some(vf) = format.vf.as_deref() {
+        if !vf_allowed(vf) {
+            return Err(format!("video filter not allowed: {:?}", vf));
+        }
+    }
+    Ok(())
 }
 
 /// Append the teed keyframe filtergraph + the main-output maps. MUST be emitted
@@ -350,59 +572,100 @@ fn append_tap_post(cmd: &mut Command, dir: &str, total_duration: f64) {
     ]);
 }
 
-/// Executes the ffmpeg command to transcode a video file based on the specified parameters.
-/// This function supports GPU acceleration and handles various video formats.
+/// `-t` for a format that keeps only the start of the video.
+fn trim_duration(format: &VideoFormat, total_duration: f64) -> Option<f64> {
+    if format.hls.unwrap_or(false) {
+        return None;
+    }
+    format.trim_percent.and_then(|pct| {
+        if (1..=99).contains(&pct) && total_duration > 0.0 {
+            Some(total_duration * (pct as f64) / 100.0)
+        } else {
+            None
+        }
+    })
+}
+
+/// True for encoders with a `-cpu-used` option. Others refuse to start if given it.
+fn has_cpu_used_option(vcodec: &str) -> bool {
+    vcodec == "libaom-av1" || vcodec.starts_with("libvpx")
+}
+
+/// Append the output: an HLS playlist with its segments, or a single file. MUST come
+/// after all the options that apply to it.
+fn add_output(cmd: &mut Command, file_name: &str, format: &VideoFormat) -> Result<(), Status> {
+    if format.hls.unwrap_or(false) {
+        let hls_dir = hls_output_dir(file_name);
+        std::fs::create_dir_all(&hls_dir)
+            .map_err(|e| Status::new(Code::Internal, format!("Failed to create HLS dir: {}", e)))?;
+        let hls_time = format.hls_time.unwrap_or(6).to_string();
+        cmd.args([
+            "-f",
+            "hls",
+            "-hls_time",
+            &hls_time,
+            "-hls_segment_type",
+            "fmp4",
+            "-hls_flags",
+            "+split_by_time",
+            "-hls_list_size",
+            "0",
+            "-hls_playlist_type",
+            "vod",
+            "-hls_fmp4_init_filename",
+            "init.mp4",
+            "-hls_segment_filename",
+            &format!("{}/seg_%04d.m4s", hls_dir),
+            "-y",
+            &format!("{}/playlist.m3u8", hls_dir),
+        ]);
+    } else {
+        cmd.args(["-y", plain_output_path(file_name, &format.ext).as_str()]);
+    }
+    Ok(())
+}
+
+/// Builds the ffmpeg command to transcode a video file based on the specified parameters.
 ///
 /// # Arguments
-/// * `task_id` - A unique identifier for the transcoding task.
-/// * `format_index` - The index specifying the target video format from a predefined list.
 /// * `file_path` - The path to the input video file to be transcoded.
-/// * `file_name` - The name of the input video file.
-/// * `is_gpu` - A boolean flag indicating whether to use GPU acceleration for transcoding.
+/// * `file_name` - The name its outputs are based on.
+/// * `is_gpu` - Whether this format runs on the GPU. The encoder itself comes from `format`.
 /// * `format` - The desired output video format.
 /// * `total_duration` - The total duration of the video file in seconds.
+/// * `tap_dir` - Where the moderation tap puts its frames, if this format owns the tap.
+/// * `pin_streams` - The gate is armed, so outputs must use the stream the tap reads.
 ///
-/// # Returns
-/// A `Result<(), Status>` indicating the success or failure of the transcoding operation.
-///
-#[allow(clippy::too_many_arguments)]
-fn run_ffmpeg(
-    task_id: String,
-    format_index: usize,
+fn build_ffmpeg_command(
     file_path: &str,
     file_name: &str,
     is_gpu: bool,
     format: &VideoFormat,
     total_duration: f64,
     tap_dir: Option<&str>,
-) -> Result<(), Status> {
+    pin_streams: bool,
+) -> Result<Command, Status> {
+    let vcodec = format.vcodec.as_deref().filter(|codec| !codec.is_empty());
+    let acodec = format.acodec.as_deref().filter(|codec| !codec.is_empty());
+    let audio_only = vcodec.is_none() && acodec.is_some();
+
+    // On the GPU path, naming no codec leaves the choice to FFmpeg.
+    if !is_gpu && vcodec.is_none() && acodec.is_none() {
+        return Err(Status::new(Code::InvalidArgument, "No codec specified"));
+    }
+
     let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-nostdin");
     cmd.arg("-v").arg("info");
     cmd.arg("-progress").arg("pipe:2");
     cmd.arg("-stats_period").arg("1");
-
-    let trim_duration: Option<f64> = format.trim_percent.and_then(|pct| {
-        if pct >= 1 && pct <= 99 && total_duration > 0.0 {
-            Some(total_duration * (pct as f64) / 100.0)
-        } else {
-            None
-        }
-    });
-    let trim_duration = if format.hls.unwrap_or(false) {
-        None
-    } else {
-        trim_duration
-    };
-    // Progress should track against trimmed duration, not full source
-    let progress_duration = trim_duration.unwrap_or(total_duration);
 
     // Moderation tap (A1): a teed keyframe side-output on the SAME ffmpeg command.
     // `do_tap` also requires a foldable `vf` (no graph-injection) and a video codec;
     // a non-foldable `vf` emits no tap → the Phase-5 gate HOLDs the (unscaled,
     // never-published) job.
-    let do_tap = tap_dir.is_some()
-        && vf_foldable(format.vf.as_deref())
-        && format.vcodec.as_deref().is_some_and(|v| !v.is_empty());
+    let tap_output = tap_dir.filter(|_| vf_foldable(format.vf.as_deref()) && vcodec.is_some());
+    let do_tap = tap_output.is_some();
     // Tap-only: computed lazily so the sampling env knobs
     // (MODERATION_SAMPLE_INTERVAL_SECS / _KEYFRAME_MAX / _MAX_INTERVAL_SECS) are
     // never read on the tap-less path (`MODERATION_GATE=off` passes `tap_dir: None`).
@@ -425,321 +688,147 @@ fn run_ffmpeg(
         );
     }
 
-    if is_gpu {
-        println!(
-            "GPU transcoding is being executed with vcodec: {:?}",
-            format.vcodec
-        );
+    println!(
+        "{} transcoding is being executed with vcodec: {:?}",
+        if is_gpu { "GPU" } else { "CPU" },
+        format.vcodec
+    );
 
-        if let Some(file_path) = Some(file_path) {
-            add_arg(&mut cmd, "-i", Some(file_path));
-        }
-        if let Some(vcodec) = format.vcodec.as_deref() {
-            add_video_codec(&mut cmd, vcodec);
-        }
-        if let Some(b_v) = format.b_v.as_deref() {
-            add_arg(&mut cmd, "-b:v", Some(b_v));
-        }
-        if let Some(c_a) = format.c_a.as_deref() {
-            add_arg(&mut cmd, "-c:a", Some(c_a));
-        }
-        if let Some(b_a) = format.b_a.as_deref() {
-            add_arg(&mut cmd, "-b:a", Some(b_a));
-        }
-        if let Some(ch) = format.ch {
-            add_arg(&mut cmd, "-ac", Some(&ch.to_string()));
-        }
-        if let Some(ar) = format.ar.as_deref() {
-            add_arg(&mut cmd, "-ar", Some(ar));
-        }
-        // See the CPU-path note below: gate on `do_tap`, not `tap_dir`, or a
-        // non-foldable-vf format silently loses its scaling.
-        if !do_tap {
-            if let Some(vf) = format.vf.as_deref() {
-                add_arg(&mut cmd, "-vf", Some(vf));
-            }
-        }
-        if let Some(ref minrate) = format.minrate {
-            cmd.args(["-minrate", minrate]);
-        }
-        if let Some(ref maxrate) = format.maxrate {
-            cmd.args(["-maxrate", maxrate]);
-        }
-        if let Some(ref bufsize) = format.bufsize {
-            cmd.args(["-bufsize", bufsize]);
-        }
-        if let Some(td) = trim_duration {
-            cmd.args(["-t", &format!("{:.3}", td)]);
-        }
-        if do_tap {
-            let dir = tap_dir.unwrap();
-            std::fs::create_dir_all(dir)
-                .map_err(|e| Status::new(Code::Internal, format!("modtap dir: {}", e)))?;
-            append_tap_pre(&mut cmd, format.vf.as_deref(), &fps_str);
-        }
-        if format.hls.unwrap_or(false) {
-            let hls_dir = hls_output_dir(file_name);
-            std::fs::create_dir_all(&hls_dir).map_err(|e| {
-                Status::new(Code::Internal, format!("Failed to create HLS dir: {}", e))
-            })?;
-            let hls_time = format.hls_time.unwrap_or(6).to_string();
-            cmd.args([
-                "-f",
-                "hls",
-                "-hls_time",
-                &hls_time,
-                "-hls_segment_type",
-                "fmp4",
-                "-hls_flags",
-                "+split_by_time",
-                "-hls_list_size",
-                "0",
-                "-hls_playlist_type",
-                "vod",
-                "-hls_fmp4_init_filename",
-                "init.mp4",
-                "-hls_segment_filename",
-                &format!("{}/seg_%04d.m4s", hls_dir),
-                "-y",
-                &format!("{}/playlist.m3u8", hls_dir),
-            ]);
-        } else {
-            cmd.args([
-                "-y",
-                format!(
-                    "{}{}_ue.{}",
-                    *PATH_TO_TRANSCODED_FILE, file_name, format.ext
-                )
-                .as_str(),
-            ]);
-        }
-
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        println!("ffmpeg {}", args.join(" "));
-    } else {
-        if let Some(vcodec) = &format.vcodec {
-            if !vcodec.is_empty() {
-                println!(
-                    "CPU transcoding is being executed with vcodec: {:?}",
-                    format.vcodec
-                );
-
-                add_arg(&mut cmd, "-cpu-used", Some("4"));
-
-                if let Some(file_path) = Some(file_path) {
-                    add_arg(&mut cmd, "-i", Some(file_path));
-                }
-                if let Some(vcodec) = format.vcodec.as_deref() {
-                    add_video_codec(&mut cmd, vcodec);
-                }
-                if let Some(b_v) = format.b_v.as_deref() {
-                    add_arg(&mut cmd, "-b:v", Some(b_v));
-                }
-                if let Some(c_a) = format.c_a.as_deref() {
-                    add_arg(&mut cmd, "-c:a", Some(c_a));
-                }
-                if let Some(b_a) = format.b_a.as_deref() {
-                    add_arg(&mut cmd, "-b:a", Some(b_a));
-                }
-                if let Some(ch) = format.ch {
-                    add_arg(&mut cmd, "-ac", Some(&ch.to_string()));
-                }
-                if let Some(ar) = format.ar.as_deref() {
-                    add_arg(&mut cmd, "-ar", Some(ar));
-                }
-                // Suppress `-vf` ONLY when the tap actually folds it into the
-                // filtergraph. Keying this on `tap_dir.is_none()` was wrong:
-                // `do_tap` additionally requires a foldable vf and a video
-                // codec, so a format handed a tap_dir but rejected by either
-                // check lost its `-vf` entirely and silently produced an
-                // unscaled rendition.
-                if !do_tap {
-                    if let Some(vf) = format.vf.as_deref() {
-                        add_arg(&mut cmd, "-vf", Some(vf));
-                    }
-                }
-                if let Some(ref minrate) = format.minrate {
-                    cmd.args(["-minrate", minrate]);
-                }
-                if let Some(ref maxrate) = format.maxrate {
-                    cmd.args(["-maxrate", maxrate]);
-                }
-                if let Some(ref bufsize) = format.bufsize {
-                    cmd.args(["-bufsize", bufsize]);
-                }
-                if let Some(td) = trim_duration {
-                    cmd.args(["-t", &format!("{:.3}", td)]);
-                }
-                if do_tap {
-                    let dir = tap_dir.unwrap();
-                    std::fs::create_dir_all(dir)
-                        .map_err(|e| Status::new(Code::Internal, format!("modtap dir: {}", e)))?;
-                    append_tap_pre(&mut cmd, format.vf.as_deref(), &fps_str);
-                }
-                if format.hls.unwrap_or(false) {
-                    let hls_dir = hls_output_dir(file_name);
-                    std::fs::create_dir_all(&hls_dir).map_err(|e| {
-                        Status::new(Code::Internal, format!("Failed to create HLS dir: {}", e))
-                    })?;
-                    let hls_time = format.hls_time.unwrap_or(6).to_string();
-                    cmd.args([
-                        "-f",
-                        "hls",
-                        "-hls_time",
-                        &hls_time,
-                        "-hls_segment_type",
-                        "fmp4",
-                        "-hls_flags",
-                        "+split_by_time",
-                        "-hls_list_size",
-                        "0",
-                        "-hls_playlist_type",
-                        "vod",
-                        "-hls_fmp4_init_filename",
-                        "init.mp4",
-                        "-hls_segment_filename",
-                        &format!("{}/seg_%04d.m4s", hls_dir),
-                        "-y",
-                        &format!("{}/playlist.m3u8", hls_dir),
-                    ]);
-                } else {
-                    cmd.args([
-                        "-y",
-                        format!(
-                            "{}{}_ue.{}",
-                            *PATH_TO_TRANSCODED_FILE, file_name, format.ext
-                        )
-                        .as_str(),
-                    ]);
-                }
-
-                let args: Vec<String> = cmd
-                    .get_args()
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect();
-                println!("ffmpeg {}", args.join(" "));
-            } else {
-                return Err(Status::new(
-                    Code::InvalidArgument,
-                    "No video codec specified",
-                ));
-            }
-        } else if let Some(acodec) = &format.acodec {
-            if !acodec.is_empty() {
-                add_arg(&mut cmd, "-i", Some(file_path));
-                add_arg(&mut cmd, "-acodec", format.acodec.as_deref());
-                if let Some(ch) = format.ch {
-                    add_arg(&mut cmd, "-ac", Some(&ch.to_string()));
-                }
-                add_arg(&mut cmd, "-ar", format.ar.as_deref());
-                if let Some(compression_level) = format.compression_level {
-                    add_arg(
-                        &mut cmd,
-                        "-compression_level",
-                        Some(&compression_level.to_string()),
-                    );
-                }
-                if let Some(td) = trim_duration {
-                    cmd.args(["-t", &format!("{:.3}", td)]);
-                }
-                if format.hls.unwrap_or(false) {
-                    let hls_dir = hls_output_dir(file_name);
-                    std::fs::create_dir_all(&hls_dir).map_err(|e| {
-                        Status::new(Code::Internal, format!("Failed to create HLS dir: {}", e))
-                    })?;
-                    let hls_time = format.hls_time.unwrap_or(6).to_string();
-                    cmd.args([
-                        "-f",
-                        "hls",
-                        "-hls_time",
-                        &hls_time,
-                        "-hls_segment_type",
-                        "fmp4",
-                        "-hls_flags",
-                        "+split_by_time",
-                        "-hls_list_size",
-                        "0",
-                        "-hls_playlist_type",
-                        "vod",
-                        "-hls_fmp4_init_filename",
-                        "init.mp4",
-                        "-hls_segment_filename",
-                        &format!("{}/seg_%04d.m4s", hls_dir),
-                        "-y",
-                        &format!("{}/playlist.m3u8", hls_dir),
-                    ]);
-                } else {
-                    add_arg(
-                        &mut cmd,
-                        "-y",
-                        Some(&format!(
-                            "{}{}_ue.{}",
-                            *PATH_TO_TRANSCODED_FILE, file_name, format.ext
-                        )),
-                    );
-                }
-            } else {
-                return Err(Status::new(
-                    Code::InvalidArgument,
-                    "No audio codec specified",
-                ));
-            }
-        } else {
-            return Err(Status::new(Code::InvalidArgument, "No codec specified"));
+    add_arg(&mut cmd, "-i", Some(file_path));
+    if let Some(vcodec) = vcodec {
+        add_video_codec(&mut cmd, vcodec);
+        if !is_gpu && has_cpu_used_option(vcodec) {
+            add_arg(&mut cmd, "-cpu-used", Some("4"));
         }
     }
+    if audio_only {
+        // Without this FFmpeg can encode the video too, for a container with a place
+        // for cover art: a whole video decode, and a surprise in the output.
+        cmd.arg("-vn");
+        add_arg(&mut cmd, "-acodec", acodec);
+    }
+    add_arg(&mut cmd, "-b:v", format.b_v.as_deref());
+    add_arg(&mut cmd, "-c:a", format.c_a.as_deref());
+    add_arg(&mut cmd, "-b:a", format.b_a.as_deref());
+    if let Some(ch) = format.ch {
+        add_arg(&mut cmd, "-ac", Some(&ch.to_string()));
+    }
+    add_arg(&mut cmd, "-ar", format.ar.as_deref());
+    if audio_only {
+        if let Some(compression_level) = format.compression_level {
+            add_arg(
+                &mut cmd,
+                "-compression_level",
+                Some(&compression_level.to_string()),
+            );
+        }
+    }
+    // Suppress `-vf` ONLY when the tap actually folds it into the
+    // filtergraph. Keying this on `tap_dir.is_none()` was wrong:
+    // `do_tap` additionally requires a foldable vf and a video
+    // codec, so a format handed a tap_dir but rejected by either
+    // check lost its `-vf` entirely and silently produced an
+    // unscaled rendition.
+    if !do_tap && !audio_only {
+        add_arg(&mut cmd, "-vf", format.vf.as_deref());
+    }
+    if !audio_only {
+        add_arg(&mut cmd, "-minrate", format.minrate.as_deref());
+        add_arg(&mut cmd, "-maxrate", format.maxrate.as_deref());
+        add_arg(&mut cmd, "-bufsize", format.bufsize.as_deref());
+    }
+    if let Some(td) = trim_duration(format, total_duration) {
+        cmd.args(["-t", &format!("{:.3}", td)]);
+    }
+    if let Some(dir) = tap_output {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Status::new(Code::Internal, format!("modtap dir: {}", e)))?;
+        append_tap_pre(&mut cmd, format.vf.as_deref(), &fps_str);
+    } else if pin_streams && vcodec.is_some() {
+        // The tap reads the first video stream, so every published video has to as
+        // well. Left to itself FFmpeg takes the biggest, which may not be the first.
+        // Optional, as a source can be audio only.
+        cmd.args(["-map", "0:v:0?", "-map", "0:a:0?"]);
+    }
+    add_output(&mut cmd, file_name, format)?;
 
     // Append the keyframe PNG tap output AFTER the main `-y <output>` (its `-map [k]`
     // binds to this last output file).
-    if do_tap {
-        append_tap_post(&mut cmd, tap_dir.unwrap(), total_duration);
+    if let Some(dir) = tap_output {
+        append_tap_post(&mut cmd, dir, total_duration);
     }
+
+    Ok(cmd)
+}
+
+/// Runs ffmpeg for one format, keeping the job's progress up to date as it goes.
+///
+/// # Arguments
+/// * `task_id` - A unique identifier for the transcoding task.
+/// * `format_index` - The index specifying the target video format from a predefined list.
+/// * The rest as in `build_ffmpeg_command`.
+///
+/// # Returns
+/// A `Result<(), Status>` indicating the success or failure of the transcoding operation.
+///
+#[allow(clippy::too_many_arguments)]
+async fn run_ffmpeg(
+    task_id: &str,
+    format_index: usize,
+    file_path: &str,
+    file_name: &str,
+    is_gpu: bool,
+    format: &VideoFormat,
+    total_duration: f64,
+    tap_dir: Option<&str>,
+    pin_streams: bool,
+) -> Result<(), Status> {
+    let cmd = build_ffmpeg_command(
+        file_path,
+        file_name,
+        is_gpu,
+        format,
+        total_duration,
+        tap_dir,
+        pin_streams,
+    )?;
 
     // Log the exact argv before spawning. The tap builds a two-output
     // filter_complex command, and when one of those graphs fails to configure
     // FFmpeg's error names a filter pad rather than anything traceable back to
     // a format id — which is otherwise only diagnosable by bisecting on the
-    // host. Cheap, once per ffmpeg run, and never carries a secret.
+    // host. Cheap, once per ffmpeg run, and never carries a secret: encrypted
+    // sources are cached under a hash of their CID (`source_file_path`).
     println!(
-        "ffmpeg argv (format {} do_tap={}): {:?} {:?}",
+        "ffmpeg argv (format {}): {:?} {:?}",
         format.id,
-        do_tap,
         cmd.get_program(),
         cmd.get_args().collect::<Vec<_>>()
     );
 
-    cmd.stderr(Stdio::piped()).stdout(Stdio::null());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| Status::new(Code::Internal, format!("ffmpeg spawn: {}", e)))?;
-
-    if let Some(stderr) = child.stderr.take() {
-        let reader = BufReader::new(stderr);
-        let mut last_progress = 0;
-        for line_result in reader.lines() {
-            if let Ok(line) = line_result {
-                if let Some(progress) = parse_progress(&line, progress_duration) {
-                    last_progress = progress;
-                    let scaled_progress = if format.hls.unwrap_or(false) {
-                        (last_progress as f64 * 0.7) as i32
-                    } else {
-                        last_progress
-                    };
-                    shared::update_progress(&task_id, format_index, scaled_progress);
-                }
-                println!("£££££ {} £££££", line);
-                println!("Progress: {}%", last_progress);
+    // Progress should track against trimmed duration, not full source
+    let progress_duration = trim_duration(format, total_duration).unwrap_or(total_duration);
+    let is_hls = format.hls.unwrap_or(false);
+    let mut next_progress_log = 0;
+    let output = run_ffmpeg_child(cmd, ffmpeg_stall_limit(), |line| {
+        if let Some(progress) = parse_progress(line, progress_duration) {
+            let scaled_progress = if is_hls {
+                (progress as f64 * 0.7) as i32
+            } else {
+                progress
+            };
+            shared::update_progress(task_id, format_index, scaled_progress);
+            if progress >= next_progress_log {
+                println!("Progress: format {} at {}%", format.id, progress);
+                next_progress_log = progress + 10;
             }
         }
-    }
-
-    let output = child
-        .wait()
-        .map_err(|e| Status::new(Code::Internal, format!("ffmpeg wait: {}", e)))?;
+        if !is_progress_line(line) {
+            println!("ffmpeg: {}", line);
+        }
+    })
+    .await
+    .map_err(|e| Status::new(Code::Internal, e))?;
     println!("Transcode finished with status: {}", output);
 
     if !output.success() {
@@ -782,6 +871,8 @@ pub struct LocalOutput {
     pub total_duration: f64,
     pub preview_percent: u32,
     pub video_format: serde_json::Value,
+    /// Protects the output from GC while it's needed, and deletes it after.
+    pub local_file: LocalFile,
 }
 
 /// Inline produce→publish wrapper — behaviour unchanged. Phase 5 calls produce and
@@ -804,12 +895,18 @@ pub async fn transcode_video(
         is_gpu,
         preview_percent,
         None,
+        false,
     )
     .await?;
     transcode_video_publish(out).await
 }
 
 /// Transcode (with an optional moderation tap) into local files, WITHOUT uploading.
+///
+/// Outputs are named after the task and the format's place in it. That keeps jobs
+/// apart when they run on one source at the same time (with one shared name, each
+/// could overwrite, or on a hold delete, what the other was still using), and it
+/// allows two formats in one job to share an id.
 #[allow(clippy::too_many_arguments)]
 pub async fn transcode_video_produce(
     task_id: String,
@@ -820,6 +917,7 @@ pub async fn transcode_video_produce(
     is_gpu: bool,
     preview_percent: u32,
     tap_dir: Option<&str>,
+    pin_streams: bool,
 ) -> Result<LocalOutput, Status> {
     println!("transcode_video: Processing video at: {}", file_path);
     println!("transcode_video: video_format: {}", video_format);
@@ -836,17 +934,26 @@ pub async fn transcode_video_produce(
     let video_format_value: serde_json::Value = serde_json::from_str(video_format)
         .map_err(|e| Status::new(Code::Internal, format!("video_format json: {}", e)))?;
 
-    let file_name = format!("{}_{}", file_name, format.id);
+    let file_name = format!("{}_{}_{}_{}", file_name, format.id, task_id, format_index);
 
-    let total_duration = get_video_duration(file_path).unwrap_or(0.0);
+    let total_duration = get_video_duration(file_path).await.unwrap_or(0.0);
     println!("Total video duration: {} seconds", total_duration);
 
     let gpu_flag = format.gpu.unwrap_or(is_gpu);
     let encrypt_flag = format.encrypt.unwrap_or(is_encrypted);
     let is_hls = format.hls.unwrap_or(false);
 
+    // Held from before FFmpeg starts: GC could otherwise take the file while it's
+    // being written, and if this fails what's been written so far is removed.
+    let output_path = local_output_path(&file_name, &format.ext, is_hls);
+    let local_file = if is_hls {
+        LocalFile::dir(&output_path)
+    } else {
+        LocalFile::file(&output_path)
+    };
+
     run_ffmpeg(
-        task_id.clone(),
+        &task_id,
         format_index,
         file_path,
         &file_name,
@@ -854,7 +961,9 @@ pub async fn transcode_video_produce(
         &format,
         total_duration,
         tap_dir,
-    )?;
+        pin_streams,
+    )
+    .await?;
 
     Ok(LocalOutput {
         task_id,
@@ -867,10 +976,13 @@ pub async fn transcode_video_produce(
         total_duration,
         preview_percent,
         video_format: video_format_value,
+        local_file,
     })
 }
 
-/// Publish a produced output to S5. **The only code that writes to S5.**
+/// Publish a produced output to S5. **The only code that writes to S5.** The local
+/// copy goes when this returns, however it went: names are per task, so nothing will
+/// ever use it again, and until then it's a decrypted copy on disk.
 pub async fn transcode_video_publish(
     out: LocalOutput,
 ) -> Result<Response<TranscodeVideoResponse>, Status> {
@@ -885,6 +997,7 @@ pub async fn transcode_video_publish(
         total_duration,
         preview_percent,
         video_format: _,
+        local_file: _local_file,
     } = out;
 
     if is_hls {
@@ -913,201 +1026,553 @@ pub async fn transcode_video_publish(
         }));
     }
 
-    let mut encryption_key1: Vec<u8> = Vec::new();
-    let response: TranscodeVideoResponse;
-
-    if encrypt_flag {
-        match encrypt_file_xchacha20(
-            format!("{}{}_ue.{}", *PATH_TO_TRANSCODED_FILE, file_name, ext),
-            format!("{}{}.{}", *PATH_TO_TRANSCODED_FILE, file_name, ext),
-            0,
-        ) {
-            Ok(bytes) => {
-                // Encryption succeeded, and `bytes` contains the encrypted data
-                // Add your success handling code here
-                encryption_key1 = bytes;
-                println!("Encryption succeeded");
-            }
-            Err(error) => {
-                // Encryption failed
-                // Handle the error here
-                eprintln!("Encryption error: {:?}", error);
-                // Optionally, you can return an error or perform error-specific handling
-            }
-        }
-
-        let file_path = format!("{}{}_ue.{}", *PATH_TO_TRANSCODED_FILE, file_name, ext);
-        let file_path_encrypted = format!("{}{}.{}", *PATH_TO_TRANSCODED_FILE, file_name, ext);
-
-        let hash_result = hash_blake3_file(file_path.clone());
-        let hash_result_encrypted = hash_blake3_file(file_path_encrypted.to_owned());
-
-        let cid_type_encrypted: u8 = 0xae; // replace with your actual cid type encrypted
-        let encryption_algorithm: u8 = 0xa6; // replace with your actual encryption algorithm
-        let chunk_size_as_power_of_2: u8 = 18; // replace with your actual chunk size as power of 2
-        let padding: u32 = 0; // replace with your actual padding
+    let file_path = plain_output_path(&file_name, &ext);
+    let response = if encrypt_flag {
+        let encrypted_file = LocalFile::file(&format!(
+            "{}{}.{}",
+            *PATH_TO_TRANSCODED_FILE, file_name, ext
+        ));
+        let encrypted = encrypt_and_hash(file_path, encrypted_file.path().to_string()).await?;
 
         // Upload the transcoded videos to storage
-        match upload_video(file_path_encrypted.as_str(), dest).await {
-            Ok(cid_encrypted) => {
-                println!(
-                    "****************************************** cid: {:?}",
-                    &cid_encrypted
-                );
-
-                let mut hash = Vec::new();
-                match hash_result {
-                    Ok(hash1) => {
-                        hash = hash1.as_bytes().to_vec();
-                        // Now you can use bytes as needed.
-                    }
-                    Err(err) => {
-                        eprintln!("Error computing blake3 hash: {}", err);
-
-                        return Err(Status::new(
-                            Code::Internal,
-                            format!("Error computing blake3 hash: {}", err),
-                        ));
-                    }
-                }
-
-                let mut hash_encrypted = Vec::new();
-                match hash_result_encrypted {
-                    Ok(hash1) => {
-                        hash_encrypted = hash1.as_bytes().to_vec();
-                        // Now you can use bytes as needed.
-                    }
-                    Err(err) => {
-                        eprintln!("Error computing blake3 hash: {}", err);
-
-                        return Err(Status::new(
-                            Code::Internal,
-                            format!("Error computing blake3 hash: {}", err),
-                        ));
-                    }
-                }
-
-                let mut encrypted_blob_hash = vec![0x1f];
-                encrypted_blob_hash.extend(hash_encrypted);
-
-                let cloned_hash = encrypted_blob_hash.clone();
-
-                let file_path_path = Path::new(&file_path);
-                // Graceful Err (not panic): the deferred publish widens the window in
-                // which the GC could evict this intermediate; a missing file must drop
-                // the format, not crash the worker.
-                let metadata = std::fs::metadata(file_path_path).map_err(|e| {
-                    Status::new(
-                        Code::Internal,
-                        format!("read metadata for {}: {}", file_path, e),
-                    )
-                })?;
-                let file_size = metadata.len();
-
-                let cid = hash_bytes_to_cid(hash, file_size);
-
-                println!("encryption_key1: {:?}", encryption_key1);
-                println!("cid_encrypted: {:?}", cid_encrypted);
-                println!("cid: {:?}", cid);
-
-                println!(
-                    "upload_video Ok: encrypted_blob_hash = {:?}",
-                    hex::encode(&encrypted_blob_hash)
-                );
-                println!(
-                    "upload_video Ok: encryption_key1 = {:?}",
-                    hex::encode(&encryption_key1)
-                );
-                println!("upload_video Ok: cid = {:?}", hex::encode(&cid));
-
-                let hash = hash_blake3_file(file_path_encrypted).unwrap();
-                println!(
-                    "`upload_video: encryptedBlobMHashBase64url` = {}",
-                    general_purpose::URL_SAFE_NO_PAD
-                        .encode([&[31u8] as &[_], hash.as_bytes()].concat())
-                );
-
-                let encrypted_cid_bytes = create_encrypted_cid(
-                    cid_type_encrypted,
-                    encryption_algorithm,
-                    chunk_size_as_power_of_2,
-                    encrypted_blob_hash,
-                    encryption_key1,
-                    padding,
-                    cid,
-                );
-
-                println!(
-                    "upload_video Ok: encrypted_cid_bytes = {:?}",
-                    hex::encode(&encrypted_cid_bytes)
-                );
-                let encrypted_cid = format!("u{}", bytes_to_base64url(&encrypted_cid_bytes));
-                println!("upload_video Ok: encrypted_cid = {}", encrypted_cid);
-
-                // Now you have your encrypted_blob_hash and encrypted_cid
-                println!("Encrypted Blob Hash: {:02x?}", cloned_hash);
-                println!("Encrypted CID: {:?}", encrypted_cid);
-
+        match upload_video(encrypted_file.path(), dest).await {
+            Ok(_) => {
                 println!("Transcoding task finished");
-
-                // Return the TranscodeVideoResponse with the job ID
-                response = TranscodeVideoResponse {
+                TranscodeVideoResponse {
                     status_code: 200,
                     message: String::from("Transcoding successful"),
-                    cid: encrypted_cid,
+                    cid: encrypted.into_cid(),
                     duration: total_duration,
-                };
+                }
             }
-            Err(e) => {
-                println!("!!!!!!!!!!!!!!!!!!!!!2160p no cid");
-                println!("Error: {}", e); // This line is added to print out the error message
-
-                response = TranscodeVideoResponse {
-                    status_code: 500,
-                    message: format!("Transcoding task failed with error {}", e),
-                    cid: "".to_string(),
-                    duration: 0.0,
-                };
-            }
-        };
+            Err(e) => failed_upload_response(e),
+        }
     } else {
-        let file_path = format!("{}{}_ue.{}", *PATH_TO_TRANSCODED_FILE, file_name, ext);
-
         // Upload the transcoded videos to storage
         match upload_video(file_path.as_str(), dest.clone()).await {
             Ok(cid) => {
-                println!("cid: {:?}", cid);
-
                 println!("Transcoding task finished");
-
-                // Return the TranscodeVideoResponse with the job ID
-                response = TranscodeVideoResponse {
+                TranscodeVideoResponse {
                     status_code: 200,
                     message: String::from("Transcoding successful"),
                     cid,
                     duration: total_duration,
-                };
+                }
             }
-            Err(e) => {
-                println!("!!!!!!!!!!!!!!!!!!!!!2160p no cid");
-                println!("Error: {}", e); // This line is added to print out the error message
-
-                response = TranscodeVideoResponse {
-                    status_code: 500,
-                    message: format!("Transcoding task failed with error {}", e),
-                    cid: "".to_string(),
-                    duration: 0.0,
-                };
-            }
-        };
-    }
+            Err(e) => failed_upload_response(e),
+        }
+    };
 
     Ok(Response::new(response))
+}
+
+fn failed_upload_response(error: anyhow::Error) -> TranscodeVideoResponse {
+    eprintln!("Upload failed: {}", error);
+    TranscodeVideoResponse {
+        status_code: 500,
+        message: format!("Transcoding task failed with error {}", error),
+        cid: "".to_string(),
+        duration: 0.0,
+    }
+}
+
+/// What the CID of an encrypted output is made from. Holds the key, so isn't `Debug`.
+struct EncryptedOutput {
+    key: Vec<u8>,
+    hash: blake3::Hash,
+    encrypted_hash: blake3::Hash,
+    file_size: u64,
+}
+
+impl EncryptedOutput {
+    fn into_cid(self) -> String {
+        const CID_TYPE_ENCRYPTED: u8 = 0xae;
+        const ENCRYPTION_ALGORITHM: u8 = 0xa6;
+        const CHUNK_SIZE_AS_POWER_OF_2: u8 = 18;
+        const PADDING: u32 = 0;
+
+        let mut encrypted_blob_hash = vec![0x1f];
+        encrypted_blob_hash.extend(self.encrypted_hash.as_bytes());
+
+        let cid = hash_bytes_to_cid(self.hash.as_bytes().to_vec(), self.file_size);
+
+        let encrypted_cid_bytes = create_encrypted_cid(
+            CID_TYPE_ENCRYPTED,
+            ENCRYPTION_ALGORITHM,
+            CHUNK_SIZE_AS_POWER_OF_2,
+            encrypted_blob_hash,
+            self.key,
+            PADDING,
+            cid,
+        );
+        format!("u{}", bytes_to_base64url(&encrypted_cid_bytes))
+    }
+}
+
+/// Encrypts an output and hashes both copies, off the async workers because the files
+/// can be many gigabytes. Any failure stops here: carrying on would upload whatever
+/// was on disk and publish a CID with no usable key in it.
+async fn encrypt_and_hash(plain: String, encrypted: String) -> Result<EncryptedOutput, Status> {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<EncryptedOutput> {
+        let key = encrypt_file_xchacha20(plain.clone(), encrypted.clone(), 0)?;
+        Ok(EncryptedOutput {
+            key,
+            hash: hash_blake3_file(plain.clone())?,
+            encrypted_hash: hash_blake3_file(encrypted)?,
+            file_size: std::fs::metadata(&plain)?.len(),
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(encrypted)) => Ok(encrypted),
+        Ok(Err(e)) => Err(Status::new(
+            Code::Internal,
+            format!("Encryption failed: {}", e),
+        )),
+        Err(e) => Err(Status::new(
+            Code::Internal,
+            format!("Encryption task failed: {}", e),
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Watching FFmpeg: a stuck child must never stop other jobs ───────────
+
+    fn shell(script: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    const SHORT: Duration = Duration::from_millis(300);
+
+    #[test]
+    fn test_parse_media_time_reads_ffmpeg_clocks() {
+        for (line, expected) in [
+            ("out_time=00:01:02.500000", Some(62.5)),
+            (
+                "frame=  10 fps=0.0 q=28.0 size=1kB time=01:00:00.00 speed=1x",
+                Some(3600.0),
+            ),
+            ("out_time=N/A", None),
+            ("out_time=-00:00:00.023000", None),
+            ("progress=continue", None),
+        ] {
+            assert_eq!(parse_media_time(line), expected, "{}", line);
+        }
+    }
+
+    #[test]
+    fn test_stall_watch_is_only_satisfied_by_the_clock_moving_forward() {
+        let start = Instant::now();
+        let limit = Duration::from_secs(10);
+        let mut watch = StallWatch::new(Some(limit), start);
+        assert_eq!(watch.deadline(), Some(start + limit));
+
+        let later = start + Duration::from_secs(5);
+        watch.observe(1.0, later);
+        assert_eq!(watch.deadline(), Some(later + limit), "the clock moved");
+
+        watch.observe(1.0, later + Duration::from_secs(5));
+        assert_eq!(watch.deadline(), Some(later + limit), "the same time again");
+
+        watch.observe(0.5, later + Duration::from_secs(5));
+        assert_eq!(watch.deadline(), Some(later + limit), "going backwards");
+
+        assert_eq!(StallWatch::new(None, start).deadline(), None);
+    }
+
+    #[test]
+    fn test_stall_limit_comes_from_the_environment_and_zero_turns_it_off() {
+        assert_eq!(stall_limit_from(None), Some(Duration::from_secs(900)));
+        assert_eq!(stall_limit_from(Some("60")), Some(Duration::from_secs(60)));
+        assert_eq!(stall_limit_from(Some("0")), None);
+        assert_eq!(
+            stall_limit_from(Some("soon")),
+            Some(Duration::from_secs(900))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_child_that_finishes_is_reported_with_its_output() {
+        let mut lines = Vec::new();
+        let status = run_ffmpeg_child(
+            shell("echo first >&2; echo second >&2; exit 3"),
+            Some(SHORT),
+            |line| lines.push(line.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(lines, ["first", "second"]);
+    }
+
+    /// The hang that used to stop the queue: no output at all, for ever.
+    #[tokio::test]
+    async fn test_a_silent_child_is_killed_as_stalled() {
+        let started = Instant::now();
+        let error = run_ffmpeg_child(shell("exec sleep 30"), Some(SHORT), |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.contains("stalled"), "{}", error);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// FFmpeg 7 and later keep printing status reports while stuck, so output alone
+    /// says nothing. Only the media clock counts.
+    #[tokio::test]
+    async fn test_a_child_printing_without_making_progress_is_killed_as_stalled() {
+        let error = run_ffmpeg_child(
+            shell("while true; do echo frame=1; echo out_time=00:00:01.000000; sleep 0.02; done"),
+            Some(SHORT),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("stalled"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn test_a_slow_child_making_progress_is_left_alone() {
+        // Runs for about 2.5 limits, moving its clock well within each.
+        let script = "for i in 1 2 3 4 5 6 7 8; do \
+                      echo out_time=00:00:0$i.000000 >&2; sleep 0.1; done";
+        let status = run_ffmpeg_child(shell(script), Some(SHORT), |_| {})
+            .await
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// A child that closes its output and stays alive would otherwise never end.
+    #[tokio::test]
+    async fn test_a_child_that_closes_its_output_and_hangs_is_killed() {
+        let error = run_ffmpeg_child(shell("exec 2>&-; exec sleep 30"), Some(SHORT), |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.contains("stalled"), "{}", error);
+    }
+
+    /// Not valid UTF-8: subtitle and metadata text can be anything.
+    #[tokio::test]
+    async fn test_a_child_printing_bytes_that_are_not_text_is_read_to_the_end() {
+        let mut lines = Vec::new();
+        let status = run_ffmpeg_child(
+            shell(r"printf '\377\376bad\n' >&2; echo out_time=00:00:01.000000 >&2"),
+            Some(SHORT),
+            |line| lines.push(line.to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1], "out_time=00:00:01.000000");
+    }
+
+    /// The inherited stdin could stop FFmpeg waiting on a terminal that never answers.
+    #[tokio::test]
+    async fn test_a_child_reading_stdin_sees_it_closed() {
+        let status = run_ffmpeg_child(shell("cat; exit 0"), Some(SHORT), |_| {})
+            .await
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// This test's runtime has one thread. If the child were waited on with blocking
+    /// calls, the ticker below couldn't run at all until it finished.
+    #[tokio::test]
+    async fn test_waiting_on_a_child_leaves_the_async_worker_free() {
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = ticks.clone();
+        tokio::spawn(async move {
+            loop {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        tokio::task::yield_now().await;
+        let status = run_ffmpeg_child(shell("sleep 0.3"), None, |_| {})
+            .await
+            .unwrap();
+        assert!(status.success());
+        let ticks = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(ticks >= 10, "the worker was blocked: only {} ticks", ticks);
+    }
+
+    /// A job that passes its deadline is stopped by dropping it: its FFmpeg must die
+    /// with it, or the GPU session and the output file stay in use for ever.
+    #[tokio::test]
+    async fn test_stopping_the_wait_kills_the_child() {
+        let pid_file = std::env::temp_dir().join(format!("pid-{}", uuid::Uuid::new_v4()));
+        let script = format!("echo $$ > {}; exec sleep 30", pid_file.display());
+        let wait = run_ffmpeg_child(shell(&script), None, |_| {});
+        assert!(tokio::time::timeout(Duration::from_millis(300), wait)
+            .await
+            .is_err());
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let _ = std::fs::remove_file(&pid_file);
+        let proc_dir = format!("/proc/{}/stat", pid.trim());
+        for _ in 0..200 {
+            // A zombie has been killed, and is only waiting to be collected.
+            match std::fs::read_to_string(&proc_dir) {
+                Err(_) => return,
+                Ok(stat) if stat.contains(") Z ") => return,
+                Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        panic!("the child is still running");
+    }
+
+    #[tokio::test]
+    async fn test_a_probe_that_hangs_is_stopped() {
+        let started = Instant::now();
+        let result = run_probe(shell("exec sleep 30"), SHORT).await;
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_parse_duration_refuses_nonsense_without_panicking() {
+        assert_eq!(parse_duration(b"12.5\n"), Ok(12.5));
+        for bad in [&b"nan"[..], b"inf", b"-3", b"N/A", b"\xff\xfe", b""] {
+            assert!(parse_duration(bad).is_err(), "{:?}", bad);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_duration_of_a_missing_file_is_an_error() {
+        assert!(get_video_duration("/nonexistent/file.mp4").await.is_err());
+    }
+
+    #[test]
+    fn test_only_progress_lines_are_left_out_of_the_log() {
+        for line in [
+            "frame=10",
+            "out_time_ms=5",
+            "stream_0_0_q=28.0",
+            "progress=end",
+            "speed=1.0x",
+        ] {
+            assert!(is_progress_line(line), "{}", line);
+        }
+        for line in [
+            "Input #0, mov,mp4, from 'x':",
+            "[libx264 @ 0x5] using cpu capabilities",
+            "Error while decoding stream #0:0",
+        ] {
+            assert!(!is_progress_line(line), "{}", line);
+        }
+    }
+
+    // ── The FFmpeg command line ─────────────────────────────────────────────
+
+    fn format_from(json: &str) -> VideoFormat {
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn built_args(format: &str, is_gpu: bool, pin_streams: bool) -> Vec<String> {
+        crate::test_support::storage();
+        let format = format_from(format);
+        build_ffmpeg_command("in.mp4", "name", is_gpu, &format, 60.0, None, pin_streams)
+            .unwrap()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn has(args: &[String], flag: &str, value: &str) -> bool {
+        args.windows(2).any(|w| w[0] == flag && w[1] == value)
+    }
+
+    #[test]
+    fn test_ffmpeg_never_waits_on_stdin() {
+        let args = built_args(r#"{"id":1,"ext":"mp4","vcodec":"libx264"}"#, false, false);
+        assert!(args.contains(&"-nostdin".to_string()));
+    }
+
+    /// Before `-i` it is taken as an input option, and FFmpeg refuses to start: every
+    /// CPU video encode failed. Only some encoders accept it at all.
+    #[test]
+    fn test_cpu_used_is_only_given_to_encoders_that_have_it_and_after_the_input() {
+        let args = built_args(r#"{"id":1,"ext":"mp4","vcodec":"libx264"}"#, false, false);
+        assert!(!args.contains(&"-cpu-used".to_string()));
+
+        let args = built_args(
+            r#"{"id":1,"ext":"webm","vcodec":"libaom-av1"}"#,
+            false,
+            false,
+        );
+        let cpu_used = args.iter().position(|a| a == "-cpu-used").unwrap();
+        let input = args.iter().position(|a| a == "-i").unwrap();
+        assert!(input < cpu_used);
+    }
+
+    #[test]
+    fn test_a_gpu_audio_format_gets_its_codec_and_no_video() {
+        let args = built_args(
+            r#"{"id":14,"ext":"flac","acodec":"flac","compression_level":5,"gpu":true}"#,
+            true,
+            false,
+        );
+        assert!(has(&args, "-acodec", "flac"));
+        assert!(has(&args, "-compression_level", "5"));
+        assert!(args.contains(&"-vn".to_string()));
+    }
+
+    #[test]
+    fn test_a_cpu_audio_format_gets_its_bitrate_and_no_video() {
+        let args = built_args(
+            r#"{"id":8,"ext":"opus","acodec":"libopus","b_a":"128k"}"#,
+            false,
+            false,
+        );
+        assert!(has(&args, "-acodec", "libopus"));
+        assert!(has(&args, "-b:a", "128k"));
+        assert!(args.contains(&"-vn".to_string()));
+    }
+
+    #[test]
+    fn test_an_empty_video_codec_means_there_is_no_video() {
+        for is_gpu in [true, false] {
+            let args = built_args(
+                r#"{"id":8,"ext":"flac","vcodec":"","acodec":"flac"}"#,
+                is_gpu,
+                false,
+            );
+            assert!(!args.contains(&"-c:v".to_string()));
+            assert!(has(&args, "-acodec", "flac"));
+        }
+    }
+
+    #[test]
+    fn test_a_cpu_format_naming_no_codec_is_refused() {
+        crate::test_support::storage();
+        let format = format_from(r#"{"id":1,"ext":"mp4"}"#);
+        assert!(build_ffmpeg_command("in.mp4", "name", false, &format, 60.0, None, false).is_err());
+    }
+
+    /// The tap reads the first video stream, so what is published has to come from
+    /// that stream too. Left to itself FFmpeg picks the biggest, which isn't scanned.
+    #[test]
+    fn test_an_armed_gate_makes_untapped_video_use_the_stream_it_scans() {
+        let video = r#"{"id":1,"ext":"mp4","vcodec":"libx264"}"#;
+        let args = built_args(video, false, true);
+        assert!(has(&args, "-map", "0:v:0?"));
+        assert!(has(&args, "-map", "0:a:0?"));
+
+        let args = built_args(video, false, false);
+        assert!(!args.contains(&"-map".to_string()), "gate off: unchanged");
+
+        let audio = r#"{"id":8,"ext":"opus","acodec":"libopus"}"#;
+        assert!(!built_args(audio, false, true).contains(&"-map".to_string()));
+    }
+
+    #[test]
+    fn test_file_names_from_a_request_cannot_leave_the_output_directory() {
+        for bad in ["../../etc/x", "mp4/../x", "a b", ""] {
+            let format = format_from(&format!(r#"{{"id":1,"ext":"{}"}}"#, bad));
+            assert!(validate_format(&format).is_err(), "{:?}", bad);
+        }
+        assert!(validate_format(&format_from(r#"{"id":1,"ext":"mp4"}"#)).is_ok());
+    }
+
+    /// Filters can read any file: `movie=` would put held content, or anything else
+    /// on disk, into a published output that was never scanned.
+    #[test]
+    fn test_only_filters_that_cannot_read_files_are_accepted() {
+        for good in [
+            "scale=1920x1080",
+            "scale=1280:720",
+            "scale='min(1280,iw)':-2",
+            "scale=640:360,fps=30",
+            "format=yuv420p",
+            " scale=640:360",
+        ] {
+            assert!(vf_allowed(good), "{}", good);
+        }
+        for bad in [
+            "movie=/data/downloads/held[a];[in][a]overlay",
+            "scale=640:360,movie=/etc/passwd",
+            "movie=/etc/passwd",
+            "subtitles=/etc/passwd",
+            "drawtext=textfile=/etc/passwd",
+            "scale='640':360,'movie=x'",
+            r"scale=640\,movie=x",
+            "scale='640",
+            "[in]scale=640:360[out]",
+            "",
+        ] {
+            assert!(!vf_allowed(bad), "{}", bad);
+        }
+    }
+
+    // ── Local files of a job ────────────────────────────────────────────────
+
+    fn local_output(file_name: &str, ext: &str, encrypt_flag: bool) -> LocalOutput {
+        let local_file = crate::shared::LocalFile::file(&plain_output_path(file_name, ext));
+        LocalOutput {
+            task_id: "task".to_string(),
+            format_index: 0,
+            file_name: file_name.to_string(),
+            ext: ext.to_string(),
+            dest: None,
+            encrypt_flag,
+            is_hls: false,
+            total_duration: 1.0,
+            preview_percent: 0,
+            video_format: serde_json::json!({}),
+            local_file,
+        }
+    }
+
+    /// Encryption failing used to be logged and ignored: whatever was on disk got
+    /// uploaded, and the CID was built with an empty key.
+    #[tokio::test]
+    async fn test_a_failed_encryption_stops_the_publish() {
+        crate::test_support::portal();
+        let name = format!("missing-{}", uuid::Uuid::new_v4());
+        let result = transcode_video_publish(local_output(&name, "mp4", true)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_publishing_removes_the_local_output_whatever_happens() {
+        crate::test_support::portal();
+        let _uploads = crate::test_support::UPLOAD_TEST_LOCK.lock().await;
+        let name = format!("published-{}", uuid::Uuid::new_v4());
+        let path = plain_output_path(&name, "mp4");
+        std::fs::write(&path, b"output").unwrap();
+        let encrypted = format!("{}{}.mp4", *PATH_TO_TRANSCODED_FILE, name);
+
+        let response = transcode_video_publish(local_output(&name, "mp4", true))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.status_code, 200);
+        assert!(!Path::new(&path).exists(), "decrypted output left on disk");
+        assert!(
+            !Path::new(&encrypted).exists(),
+            "encrypted copy left on disk"
+        );
+    }
+
+    #[test]
+    fn test_there_is_one_spelling_of_each_local_output_path() {
+        crate::test_support::storage();
+        assert_eq!(
+            local_output_path("name", "mp4", false),
+            plain_output_path("name", "mp4")
+        );
+        assert_eq!(
+            local_output_path("name", "mp4", true),
+            hls_output_dir("name")
+        );
+    }
 
     #[test]
     fn test_publish_is_only_s5_writer() {
@@ -1147,11 +1612,11 @@ mod tests {
         assert!(src.contains("tap_dir"));
     }
 
-    #[test]
-    fn test_source_has_video_failclosed_on_probe_error() {
+    #[tokio::test]
+    async fn test_source_has_video_failclosed_on_probe_error() {
         // A non-zero ffprobe exit (missing/corrupt path) — or ffprobe absent — must NOT
         // read as audio-only; the A4 gate depends on this returning true (HOLD).
-        assert!(source_has_video("/nonexistent/definitely/not/a/file.xyz"));
+        assert!(source_has_video("/nonexistent/definitely/not/a/file.xyz").await);
     }
 
     #[test]
@@ -1178,7 +1643,7 @@ mod tests {
         // dir but rejected by either check, silently producing an unscaled
         // rendition.
         assert!(
-            src.contains("if !do_tap {"),
+            src.contains("if !do_tap && !audio_only {"),
             "the standalone -vf must be gated on !do_tap"
         );
     }
@@ -1221,27 +1686,28 @@ mod tests {
         }
     }
 
-    /// The producer/consumer pair is split across the GPU and CPU branches:
-    /// two `append_tap_pre` sites, one `append_tap_post` after both. A third
-    /// pre site, or an early return slipped between them, reintroduces the
-    /// dangling pad above.
+    /// The tap's two halves live in one command builder: one `append_tap_pre`, one
+    /// `append_tap_post` after it. An early return slipped between them, or a second
+    /// pre site, reintroduces the dangling pad above.
     #[test]
     fn test_every_tap_pre_is_matched_by_the_single_tap_post() {
         let src = include_str!("transcode_video.rs");
-        let body = &src[src.find("fn run_ffmpeg(").expect("run_ffmpeg present")..];
-        let body = &body[..body.find("\npub async fn ").unwrap_or(body.len())];
+        let body = &src[src
+            .find("fn build_ffmpeg_command(")
+            .expect("command builder present")..];
+        let body = &body[..body.find("\nasync fn ").unwrap_or(body.len())];
         let pre = body.matches("append_tap_pre(&mut cmd").count();
         let post = body.matches("append_tap_post(&mut cmd").count();
-        assert_eq!(pre, 2, "GPU and CPU paths each fold the tap into the graph");
         assert_eq!(
-            post, 1,
-            "exactly one tap output, appended after both branches"
+            pre, 1,
+            "GPU and CPU paths share one place that folds the tap"
         );
-        let last_pre = body.rfind("append_tap_pre(&mut cmd").unwrap();
+        assert_eq!(post, 1, "exactly one tap output");
+        let the_pre = body.find("append_tap_pre(&mut cmd").unwrap();
         let the_post = body.find("append_tap_post(&mut cmd").unwrap();
         assert!(
-            last_pre < the_post,
-            "the [k] consumer must be appended after every producer"
+            the_pre < the_post,
+            "the [k] consumer must be appended after its producer"
         );
     }
 

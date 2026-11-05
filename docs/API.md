@@ -168,7 +168,7 @@ Authorization: Bearer <JWT_TOKEN>
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `source_cid` | string | Yes | Content identifier of the source media file. Supports `s5://` and `ipfs://` protocol prefixes. The `s5://` prefix is stripped automatically. |
+| `source_cid` | string | Yes | Content identifier of the source media file. Supports `s5://` and `ipfs://` protocol prefixes. The prefix is required, and the CID itself can only contain letters, digits, `-`, `_` and `=`, optionally followed by a file extension. |
 | `media_formats` | string | Yes | URL-encoded JSON array of format objects (see [Media Format Configuration](#media-format-configuration)). If empty string, defaults to formats from `MEDIA_FORMATS_FILE`. |
 | `is_encrypted` | bool | Yes | Whether the source file is encrypted (XChaCha20Poly1305). **When `true`, the `PORTAL_ENCRYPT_URL` env var must be set** — the server uses it instead of `PORTAL_URL` for downloads. |
 | `is_gpu` | bool | Yes | Whether to use GPU acceleration (NVIDIA NVENC). Can be overridden per-format via the `gpu` field in the format object. |
@@ -189,6 +189,18 @@ Authorization: Bearer <JWT_TOKEN>
 | `status_code` | int | HTTP status code (200 on success) |
 | `message` | string | Human-readable status message |
 | `task_id` | string | UUID v4 identifier for polling with `/get_transcoded` |
+
+**Response** `503 Service Unavailable`
+
+The queue holds 100 waiting jobs. When it is full the job is refused straight away and nothing is queued, so `task_id` is empty. Try again later.
+
+```json
+{
+  "status_code": 503,
+  "message": "Transcode queue is full",
+  "task_id": ""
+}
+```
 
 **Example**
 
@@ -235,9 +247,9 @@ Authorization: Bearer <JWT_TOKEN>
 
 | Field | Type | Description |
 |---|---|---|
-| `status_code` | int | `200` while the job is running or finished. Any other value means the job has failed permanently (see [Failed Jobs](#failed-jobs)). The HTTP response itself is still 200. |
+| `status_code` | int | `200` while the job is queued, running or finished. Any other value means the job has failed permanently or isn't known here (see [Failed Jobs](#failed-jobs)). The HTTP response itself is still 200. |
 | `metadata` | string | JSON array (as string) of transcoded format objects, each with an added `cid` field. Value is `"Transcoding in progress"` while the job is running. |
-| `progress` | int | Overall progress percentage (0-100). Averaged across all output formats. |
+| `progress` | int | Overall progress percentage, averaged across all output formats. A running job stays at 99 or below, including while it is being moderated and uploaded. 100 means the job has finished and its result is in `metadata`. |
 | `duration` | float | Source media duration in seconds, as reported by ffprobe. `0.0` if the job has not yet completed or if ffprobe could not determine duration. |
 
 **Metadata Format (parsed)**
@@ -290,7 +302,8 @@ A non-200 `status_code` is final, so stop polling and don't expect the job to re
 | `status_code` | Meaning | `metadata` |
 |---|---|---|
 | `400` | Bad input. Retrying the same request cannot help. | `Invalid source CID`, `Invalid media formats` |
-| `500` | Anything else. | `Source download failed`, `Source metadata could not be read`, `Source decryption failed`, `Source could not be stored`, `All formats failed`, `Server configuration error`, `Internal error` |
+| `404` | This server has no record of the task. It may never have been accepted, it may have ended more than `JOB_RECORD_TTL_SECS` ago, or the server has restarted since. Submit the job again if it is still needed. | `Unknown task` |
+| `500` | Anything else. | `Source download failed`, `Source metadata could not be read`, `Source decryption failed`, `Source could not be stored`, `All formats failed`, `Job timed out`, `Server configuration error`, `Internal error` |
 
 ```json
 {
@@ -303,7 +316,7 @@ A non-200 `status_code` is final, so stop polling and don't expect the job to re
 
 - **Partial success is not a failure:** if at least one format publishes, the job returns `200`, and `metadata` lists only the formats that succeeded.
 - **A moderation hold is not a failure:** it returns `200`, `metadata` `[]` and `progress` 100.
-- **Restarts:** job status is held in memory, so after a server restart an unknown `task_id` still reads as `200` and `"Transcoding in progress"`. Clients need their own overall timeout for this case.
+- **Restarts:** jobs and their status are held in memory, so a server restart loses every queued and running job, and they then read as `404`. The server doesn't restart them, so the client needs to submit them again.
 
 ---
 
@@ -382,12 +395,13 @@ Client                          Transcoder
   |                                 |  3. Extract duration via ffprobe
   |                                 |  4. For each media format:
   |                                 |     a. FFmpeg transcode (GPU or CPU)
-  |                                 |     b. Update progress (0-100%)
+  |                                 |     b. Update progress (up to 99%)
   |                                 |     c. Encrypt output if needed
   |                                 |     d. Upload to S5/IPFS
   |                                 |     e. Record output CID
   |                                 |  5. Store metadata + duration
-  |                                 |  6. Release semaphore permit
+  |                                 |  6. Set progress to 100%
+  |                                 |  7. Release semaphore permit
   |                                 |
   |  GET /get_transcoded/abc-123    |
   |-------------------------------->|
@@ -418,7 +432,16 @@ When `is_gpu` is `true` (or overridden per-format via the `gpu` field):
 
 ### Concurrent Processing
 
-The transcoder processes multiple jobs concurrently, bounded by `MAX_CONCURRENT_TRANSCODES` (default: 3). When all slots are occupied, new jobs wait in the queue until a slot opens.
+The transcoder processes multiple jobs concurrently, bounded by `MAX_CONCURRENT_TRANSCODES` (default: 3). When all slots are occupied, new jobs wait in the queue until a slot opens. Up to 100 can wait, and beyond that new jobs are refused with a `503`.
+
+One job can't stop the others:
+
+- **A failure or panic** ends that job with a `500`, and the next one starts.
+- **A stuck FFmpeg** is killed once its media clock has stood still for `FFMPEG_STALL_TIMEOUT_SECS` (default: 15 minutes). The format fails, and any others carry on.
+- **A job stuck anywhere else** is stopped at `JOB_DEADLINE_SECS` (default: 24 hours) and reads as `Job timed out`.
+- **If the queue or cleanup task dies,** it restarts, and the jobs waiting in the queue stay there.
+- **If a listening port is lost,** the server exits so that the container's restart policy can bring it back. Queued and running jobs are lost in this case, as they are in any restart (see [Failed Jobs](#failed-jobs)).
+
 
 - **Monitoring**: Use `GET /status` to check `active_jobs`, `queued_jobs`, and `max_concurrent`
 - **Load balancing**: For multi-host deployments, poll `/status` on each host and route new jobs to the host with the most available capacity (`max_concurrent - active_jobs`)
@@ -426,10 +449,12 @@ The transcoder processes multiple jobs concurrently, bounded by `MAX_CONCURRENT_
 
 ### Cache and Garbage Collection
 
-The transcoder caches downloaded source files and transcoded outputs on disk. A background garbage collector periodically cleans up:
+The transcoder caches downloaded source files on disk. A job's other files are named after its task, kept only as long as it needs them, and deleted when it ends. A background garbage collector periodically cleans up, oldest files first, never touching a file a running job is using:
 - **Source cache**: cleaned when total size exceeds `FILE_SIZE_THRESHOLD`
-- **Transcoded cache**: cleaned when total size exceeds `TRANSCODED_FILE_SIZE_THRESHOLD`
+- **Transcoded files**: cleaned when total size exceeds `TRANSCODED_FILE_SIZE_THRESHOLD`
 - **Interval**: configurable via `GARBAGE_COLLECTOR_INTERVAL` (default: 3600 seconds)
+
+At startup the server creates `PATH_TO_FILE` and `PATH_TO_TRANSCODED_FILE` if needed, and exits if it can't write to them. It also removes temporary files left by a previous process. Cached sources stay.
 
 ---
 
@@ -442,13 +467,13 @@ The transcoder caches downloaded source files and transcoded outputs on disk. A 
 | `id` | int | Yes | Unique format identifier |
 | `label` | string | No | Human-readable label (e.g., "1080p", "720p", "129k") |
 | `type` | string | No | MIME type (e.g., "video/mp4", "audio/opus", "audio/flac") |
-| `ext` | string | Yes | Output file extension (e.g., "mp4", "opus", "flac") |
+| `ext` | string | Yes | Output file extension (e.g., "mp4", "opus", "flac"). Letters and digits only. |
 | `vcodec` | string | No | Video codec. Required for video. Options: `av1_nvenc`, `libx264` |
 | `acodec` | string | No | Audio codec. Options: `libopus`, `flac`, `aac` |
 | `preset` | string | No | Encoding preset (e.g., "medium", "slower") |
 | `profile` | string | No | Encoding profile (e.g., "main", "high") |
 | `ch` | int | No | Audio channels (e.g., 2 for stereo) |
-| `vf` | string | No | Video filter string (e.g., "scale=1920x1080") |
+| `vf` | string | No | Video filter string (e.g., "scale=1920x1080"). A chain of these filters only, because others can read files on the server: `scale`, `scale_cuda`, `scale_npp`, `hwupload_cuda`, `hwdownload`, `format`, `fps`, `crop`, `pad`, `setsar`, `setdar`, `transpose`, `hflip`, `vflip`, `yadif`, `bwdif`. |
 | `b_v` | string | No | Video bitrate (e.g., "3.5M", "12M") |
 | `b_a` | string | No | Audio bitrate (e.g., "129k", "1411k") |
 | `c_a` | string | No | Audio codec (alternative to `acodec`) |
@@ -667,6 +692,9 @@ Configure the transcoder via a `.env` file in the `transcode_server/` directory.
 | `TRANSCODED_FILE_SIZE_THRESHOLD` | Transcoded cache cleanup threshold (bytes) | `1000000000` (1 GB) |
 | `GARBAGE_COLLECTOR_INTERVAL` | Cache cleanup interval (seconds) | `3600` (1 hour) |
 | `MAX_CONCURRENT_TRANSCODES` | Maximum number of transcode jobs processed simultaneously | `3` |
+| `FFMPEG_STALL_TIMEOUT_SECS` | Kill FFmpeg once its media clock has not moved for this long. `0` turns this off. | `900` (15 minutes) |
+| `JOB_DEADLINE_SECS` | Stop a job that has run for this long since it got a slot. Set it above your longest real job. `0` turns this off. | `86400` (24 hours) |
+| `JOB_RECORD_TTL_SECS` | How long the result of a finished job can still be fetched, before it reads as `404`. | `86400` (24 hours) |
 | `NVIDIA_DRIVER_CAPABILITIES` | NVIDIA container capabilities | `compute,utility,video` |
 | `PINATA_API_KEY` | Pinata IPFS API key (if using Pinata) | (none) |
 | `PINATA_API_SECRET` | Pinata IPFS API secret | (none) |
@@ -769,15 +797,17 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 | Scenario | HTTP Status | Response |
 |---|---|---|
-| Missing/invalid JWT token | 401 | Rejection (no JSON body) |
-| Task queue full or channel closed | 500 | Rejection with `TranscodeError` |
+| Missing/invalid JWT token | 401 | `{"status_code": 401, "message": "Invalid or missing token"}` |
+| Task queue full | 503 | `{"status_code": 503, "message": "Transcode queue is full", "task_id": ""}` |
+| Task queue closed | 500 | Rejection with `TranscodeError` |
 | Invalid query parameters | 400 | Warp parameter parsing error |
 
 ### gRPC Errors
 
 | Scenario | gRPC Code | Description |
 |---|---|---|
-| Task queue send failure | `INTERNAL` (13) | Failed to send transcoding task |
+| Task queue full | `RESOURCE_EXHAUSTED` (8) | Transcode queue is full |
+| Task queue closed | `INTERNAL` (13) | Transcode queue is closed |
 | Invalid video format JSON | `INVALID_ARGUMENT` (3) | Cannot parse format configuration |
 | Missing video codec | `INVALID_ARGUMENT` (3) | No video codec specified in format |
 | Blake3 hash failure | `INTERNAL` (13) | Error computing file hash for upload |
@@ -785,12 +815,12 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 ### Transcoding Errors
 
-When a format fails to transcode, it is skipped and does not appear in the `metadata` array. Other formats continue processing. The `progress` field still reaches 100 when all formats have been attempted.
+When a format fails to transcode, it is skipped and does not appear in the `metadata` array. Other formats continue processing, and the job finishes with `progress` 100 as long as at least one format was published. If none was, the job fails (see [Failed Jobs](#failed-jobs)).
 
 ### Common Gotchas
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `Required environment variable for PORTAL_URL not found` but `PORTAL_URL` is set | `is_encrypted=true` in the request causes the server to read `PORTAL_ENCRYPT_URL` instead. The error message is misleading — it always says "PORTAL_URL" regardless of which variable is missing. | Set `PORTAL_ENCRYPT_URL` or use `is_encrypted=false`. |
-| `Invalid source CID: <cid>` | CID is missing the protocol prefix. The server requires `s5://` or `ipfs://` before the CID. | Send `s5://uCtwQM...` not `uCtwQM...`. |
-| Panic at `server.rs` `garbage_collect` / `No such file or directory` | The directories specified by `PATH_TO_FILE` and `PATH_TO_TRANSCODED_FILE` don't exist. The server does not create them on startup. | Ensure directories exist before starting (e.g., `mkdir -p` in entrypoint). |
+| `Invalid source CID` | CID is missing the protocol prefix, or contains a path or other characters a CID can't have. The server requires `s5://` or `ipfs://` before the CID. | Send `s5://uCtwQM...` not `uCtwQM...`. |
+| Server exits at startup with `FATAL: PATH_TO_FILE` or `FATAL: PATH_TO_TRANSCODED_FILE` | The variable isn't set, or the server can't create or write to that directory. | Set it, and check the mount and its permissions. |

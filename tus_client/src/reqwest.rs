@@ -9,7 +9,13 @@ impl HttpHandler for reqwest::blocking::Client {
     fn handle_request(&self, req: HttpRequest) -> Result<HttpResponse, Error> {
         let mut headers = HeaderMap::new();
         for (key, value) in req.headers {
-            headers.insert(HeaderName::from_str(&key).unwrap(), value.parse().unwrap());
+            // Not including the value in the error: this could be the token.
+            let name = HeaderName::from_str(&key)
+                .map_err(|_| Error::HttpHandlerError(format!("unusable header name: {}", key)))?;
+            let value = value
+                .parse()
+                .map_err(|_| Error::HttpHandlerError(format!("unusable value for {}", key)))?;
+            headers.insert(name, value);
         }
 
         let mut builder = match req.method {
@@ -42,5 +48,29 @@ impl HttpHandler for reqwest::blocking::Client {
             status_code: response.status().as_u16() as usize,
             headers,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A token read from a file often ends in a newline, which can't go in a header.
+    /// That used to panic on the upload thread instead of failing the upload.
+    #[test]
+    fn test_an_unusable_header_is_an_error() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let client =
+            crate::Client::new(reqwest::blocking::Client::new()).with_auth_token("token\n");
+
+        let result = client.create("http://127.0.0.1:1/", file.path());
+
+        match result {
+            Err(crate::Error::HttpHandlerError(message)) => {
+                assert!(
+                    !message.contains("token\n"),
+                    "the value must not be repeated"
+                );
+            }
+            other => panic!("expected a handler error, got {:?}", other),
+        }
     }
 }

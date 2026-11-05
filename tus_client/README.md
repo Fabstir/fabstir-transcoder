@@ -21,7 +21,7 @@ use tus_client::Client;
 use reqwest;
 
 // Assumes "reqwest" feature is enabled (see above)
-let client = Client::new(reqwest::Client::new());
+let client = Client::new(reqwest::blocking::Client::new());
 ```
 
 You'll need an upload URL to be able to upload a files. This may be provided to you (through a separate API, for example), or you might need to create the file through the *tus* protocol. If an upload URL is provided for you, you can skip this step.

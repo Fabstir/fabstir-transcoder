@@ -13,7 +13,8 @@
 #   POST /transcode?source_cid=...&media_formats=...&is_encrypted=...&is_gpu=...
 #   GET  /get_transcoded/{task_id}
 #        Response: { "status_code": 200, "metadata": "...", "progress": 0-100, "duration": <seconds> }
-#        Any non-200 status_code = job failed permanently; metadata = the reason.
+#        Any non-200 status_code = job failed permanently, or the server doesn't know
+#        it (404, e.g. after a restart); metadata = the reason. progress 100 = finished.
 # =============================================================================
 
 services:
@@ -43,6 +44,11 @@ services:
       FILE_SIZE_THRESHOLD: ${FILE_SIZE_THRESHOLD:-1000000000}                 # Source cache cleanup threshold (bytes, default 1GB)
       TRANSCODED_FILE_SIZE_THRESHOLD: ${TRANSCODED_FILE_SIZE_THRESHOLD:-1000000000}  # Transcoded cache threshold (bytes, default 1GB)
       GARBAGE_COLLECTOR_INTERVAL: ${GARBAGE_COLLECTOR_INTERVAL:-3600}         # Cache cleanup interval (seconds, default 1h)
+
+      # -- Stuck jobs (optional; these are the defaults, and 0 turns either limit off) --
+      # FFMPEG_STALL_TIMEOUT_SECS: 900   # Kill FFmpeg once its media clock has not moved for this long
+      # JOB_DEADLINE_SECS: 86400         # Stop a job this long after it got a slot. Keep it above your longest real job
+      # JOB_RECORD_TTL_SECS: 86400       # How long a finished job's result stays available
 
       # -- Authentication --
       FABSTIR_TRANSCODER_JWT: ${FABSTIR_TRANSCODER_JWT:?Required}            # JWT token for API authentication
