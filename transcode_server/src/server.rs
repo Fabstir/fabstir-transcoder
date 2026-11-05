@@ -65,6 +65,7 @@ use dotenv::{dotenv, var};
 
 static TRANSCODED: Lazy<Mutex<HashMap<String, (String, f64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static FAILED: Lazy<Mutex<HashMap<String, JobFailure>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static PATH_TO_FILE: Lazy<String> =
     Lazy::new(|| var("PATH_TO_FILE").unwrap_or_else(|_| panic!("PATH_TO_FILE not set in .env")));
 static PATH_TO_TRANSCODED_FILE: Lazy<String> = Lazy::new(|| {
@@ -197,6 +198,108 @@ fn generate_random_filename() -> String {
     format!("{}_{}", uuid, timestamp)
 }
 
+/// Why a job ended without a result. `reason` is `&'static str` on purpose: it
+/// is returned to API clients, so it must never carry URLs, paths or tokens.
+/// The detail belongs in the server log, next to where the failure happens.
+#[derive(Debug, Clone, PartialEq)]
+struct JobFailure {
+    status_code: i32,
+    reason: &'static str,
+}
+
+impl JobFailure {
+    /// The request itself was wrong; retrying it cannot help.
+    fn bad_input(reason: &'static str) -> Self {
+        JobFailure {
+            status_code: 400,
+            reason,
+        }
+    }
+
+    fn server(reason: &'static str) -> Self {
+        JobFailure {
+            status_code: 500,
+            reason,
+        }
+    }
+}
+
+/// Split `network://cid[.ext]` into the bare CID and the network name.
+fn parse_source_cid(orig: &str) -> std::result::Result<(String, String), JobFailure> {
+    let invalid = JobFailure::bad_input("Invalid source CID");
+    let (network, rest) = orig.split_once("://").ok_or_else(|| invalid.clone())?;
+    if network.is_empty() || rest.is_empty() {
+        return Err(invalid);
+    }
+    let source_cid = Path::new(orig)
+        .with_extension("")
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .ok_or(invalid)?;
+    Ok((source_cid, network.to_string()))
+}
+
+/// Formats sent by the client are bad input if they don't parse; the server's
+/// own formats file not parsing is a server fault.
+fn parse_media_formats(
+    json: &str,
+    client_supplied: bool,
+) -> std::result::Result<Vec<Value>, JobFailure> {
+    serde_json::from_str(json).map_err(|e| {
+        eprintln!("Failed to parse video formats: {:?}", e);
+        if client_supplied {
+            JobFailure::bad_input("Invalid media formats")
+        } else {
+            JobFailure::server("Server configuration error")
+        }
+    })
+}
+
+/// Nothing published and at least one format failed. All-cached (nothing
+/// published, nothing failed) and partial success both remain a 200.
+fn all_formats_failed(published: usize, failed: usize) -> bool {
+    published == 0 && failed > 0
+}
+
+async fn record_failure(task_id: &str, failure: JobFailure) {
+    eprintln!(
+        "Job failed: task_id={} status_code={} reason={}",
+        task_id, failure.status_code, failure.reason
+    );
+    FAILED.lock().await.insert(task_id.to_string(), failure);
+}
+
+/// What `GetTranscoded` reports, as (status_code, metadata, duration). Any
+/// non-200 means the job has failed permanently, with the reason in `metadata`.
+/// A moderation hold is NOT a failure: it stays 200 with `metadata` `[]`.
+async fn job_status(task_id: &str) -> (i32, String, f64) {
+    if let Some(failure) = FAILED.lock().await.get(task_id) {
+        return (failure.status_code, failure.reason.to_string(), 0.0);
+    }
+    let entry = TRANSCODED.lock().await.get(task_id).cloned();
+    let (metadata, duration) =
+        entry.unwrap_or_else(|| ("Transcoding in progress".to_string(), 0.0));
+    (200, metadata, duration)
+}
+
+/// Run a job so that every way it can end is reported. Its own task isolates a
+/// panic, so the failure is recorded and the caller still releases its counters.
+async fn supervise<F>(task_id: String, job: F)
+where
+    F: std::future::Future<Output = std::result::Result<(), JobFailure>> + Send + 'static,
+{
+    let failure = match tokio::spawn(job).await {
+        Ok(Ok(())) => return,
+        Ok(Err(failure)) => failure,
+        Err(e) => {
+            eprintln!("Job panicked: task_id={} error={:?}", task_id, e);
+            JobFailure::server("Internal error")
+        }
+    };
+    record_failure(&task_id, failure).await;
+}
+
 /// Asynchronously receives transcoding tasks from a channel and processes them using the specified transcoder. Each
 /// task involves reading an input file, transcoding it according to the provided settings, and writing the output to
 /// a specified location. Errors encountered during processing are logged, and upon completion of all tasks, a signal
@@ -214,28 +317,12 @@ async fn process_single_job(
     is_encrypted: bool,
     is_gpu: bool,
     preview_percent: u32,
-) {
+) -> std::result::Result<(), JobFailure> {
     println!("preview_percent: {}", preview_percent);
-    let source_cid = Path::new(&orig_source_cid)
-        .with_extension("")
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string());
-
-    if source_cid.is_none() {
+    let (source_cid, storage_network) = parse_source_cid(&orig_source_cid).map_err(|failure| {
         eprintln!("Invalid source CID: {}", orig_source_cid);
-        return;
-    }
-
-    let storage_network: Option<&str> = orig_source_cid
-        .split_once("://")
-        .map(|(network, _)| network);
-    if storage_network.is_none() {
-        eprintln!("Invalid source CID: {}", orig_source_cid);
-        return;
-    }
-
-    let source_cid = source_cid.unwrap();
+        failure
+    })?;
 
     let portal_url_var = if is_encrypted {
         "PORTAL_ENCRYPT_URL"
@@ -250,7 +337,7 @@ async fn process_single_job(
                 "Required environment variable {} not found (is_encrypted={})",
                 portal_url_var, is_encrypted
             );
-            return;
+            return Err(JobFailure::server("Server configuration error"));
         }
     };
 
@@ -280,7 +367,7 @@ async fn process_single_job(
                         "Failed to download encrypted video from URL {}: {}",
                         &url, e
                     );
-                    return;
+                    return Err(JobFailure::server("Source download failed"));
                 }
             };
 
@@ -291,7 +378,7 @@ async fn process_single_job(
                         "Failed to read encrypted metadata from file {}: {}",
                         &encrypted_file_path, e
                     );
-                    return;
+                    return Err(JobFailure::server("Source metadata could not be read"));
                 }
             };
 
@@ -331,16 +418,16 @@ async fn process_single_job(
                 Ok(_) => println!("Decryption succeeded"),
                 Err(error) => {
                     eprintln!("Decryption error: {:?}", error);
-                    return;
+                    return Err(JobFailure::server("Source decryption failed"));
                 }
             }
             if let Err(e) = finalize_part(&part_path, &file_path) {
                 eprintln!("Source finalise error: {:?}", e);
-                return;
+                return Err(JobFailure::server("Source could not be stored"));
             }
         } else {
-            match storage_network.as_deref() {
-                Some("ipfs") => {
+            match storage_network.as_str() {
+                "ipfs" => {
                     let url = format!("{}{}{}", *IPFS_GATEWAY, "/ipfs/", source_cid);
 
                     let part_path = format!("{}.part", file_path);
@@ -348,12 +435,12 @@ async fn process_single_job(
                         Ok(_) => println!("Video downloaded successfully from URL: {}", url),
                         Err(e) => {
                             eprintln!("Failed to download video from URL {}: {}", &url, e);
-                            return;
+                            return Err(JobFailure::server("Source download failed"));
                         }
                     };
                     if let Err(e) = finalize_part(&part_path, &file_path) {
                         eprintln!("Source finalise error: {:?}", e);
-                        return;
+                        return Err(JobFailure::server("Source could not be stored"));
                     }
                 }
                 _ => {
@@ -364,12 +451,12 @@ async fn process_single_job(
                         Ok(_) => println!("Video downloaded successfully from URL: {}", url),
                         Err(e) => {
                             eprintln!("Failed to download video from URL {}: {}", &url, e);
-                            return;
+                            return Err(JobFailure::server("Source download failed"));
                         }
                     };
                     if let Err(e) = finalize_part(&part_path, &file_path) {
                         eprintln!("Source finalise error: {:?}", e);
-                        return;
+                        return Err(JobFailure::server("Source could not be stored"));
                     }
                 }
             }
@@ -387,8 +474,7 @@ async fn process_single_job(
     };
 
     println!("media_formats_json: {}", media_formats_json);
-    let media_formats_vec: Vec<Value> =
-        serde_json::from_str(&media_formats_json).expect("Failed to parse video formats");
+    let media_formats_vec = parse_media_formats(&media_formats_json, !media_formats.is_empty())?;
 
     // Initialize progress to 0 at the start for all formats
     let formats_count = media_formats_vec.len();
@@ -398,6 +484,7 @@ async fn process_single_job(
 
     // Then, we transcode the downloaded video with each video format
     let mut transcoded_formats = Vec::new();
+    let mut failed_formats = 0usize;
     let mut source_duration: f64 = 0.0;
 
     // ── M3 shadow moderation (D1/D4): fire-and-forget, concurrent with the
@@ -440,6 +527,7 @@ async fn process_single_job(
             Ok(str) => str,
             Err(e) => {
                 eprintln!("Error serializing video format: {:?}", e);
+                failed_formats += 1;
                 continue;
             }
         };
@@ -449,6 +537,7 @@ async fn process_single_job(
             Ok(format) => format,
             Err(e) => {
                 eprintln!("Failed to get video format from string: {}", e);
+                failed_formats += 1;
                 continue; // Skip the rest of this loop iteration
             }
         };
@@ -489,6 +578,7 @@ async fn process_single_job(
                                 "Format {} failed with status {}: {}",
                                 index, response.status_code, response.message
                             );
+                            failed_formats += 1;
                             continue;
                         }
                         let mut video_format_modified = video_format.clone();
@@ -502,6 +592,7 @@ async fn process_single_job(
                     }
                     Err(e) => {
                         eprintln!("Error transcoding video: {:?}", e);
+                        failed_formats += 1;
                         continue;
                     }
                 }
@@ -558,6 +649,7 @@ async fn process_single_job(
             }
             Err(e) => {
                 eprintln!("Error producing format {}: {:?}", index, e);
+                failed_formats += 1;
                 if want_tap {
                     tapped = true; // tap owner attempted+failed → tap_ok stays false ⇒ HOLD
                 }
@@ -627,7 +719,7 @@ async fn process_single_job(
                 for i in 0..formats_count {
                     shared::update_progress(&task_id, i, 100);
                 }
-                return;
+                return Ok(());
             }
             // ── DARK (Milestone 1): record what WOULD have been held, then fall
             //    INTO the publish branch below — not around it — so the tap-dir
@@ -657,6 +749,7 @@ async fn process_single_job(
                             "Publish failed with status {}: {}",
                             response.status_code, response.message
                         );
+                        failed_formats += 1;
                         continue;
                     }
                     let mut video_format_modified = video_format_value;
@@ -665,10 +758,15 @@ async fn process_single_job(
                 }
                 Err(e) => {
                     eprintln!("Error publishing format: {:?}", e);
+                    failed_formats += 1;
                     continue;
                 }
             }
         }
+    }
+
+    if all_formats_failed(transcoded_formats.len(), failed_formats) {
+        return Err(JobFailure::server("All formats failed"));
     }
 
     let transcoded_json = serde_json::to_string(&transcoded_formats).unwrap_or_else(|e| {
@@ -683,6 +781,7 @@ async fn process_single_job(
     for i in 0..formats_count {
         shared::update_progress(&task_id, i, 100);
     }
+    Ok(())
 }
 
 /// M3 shadow moderation (HAND-OFF §5): pin the source against GC, translate
@@ -775,13 +874,16 @@ async fn transcode_task_receiver(receiver: Arc<Mutex<mpsc::Receiver<TranscodeJob
                 let permit = shared::SEMAPHORE.acquire().await.unwrap();
                 shared::decrement_queued_increment_active();
                 tokio::spawn(async move {
-                    process_single_job(
-                        job.task_id,
-                        job.source_cid,
-                        job.media_formats,
-                        job.is_encrypted,
-                        job.is_gpu,
-                        job.preview_percent,
+                    supervise(
+                        job.task_id.clone(),
+                        process_single_job(
+                            job.task_id,
+                            job.source_cid,
+                            job.media_formats,
+                            job.is_encrypted,
+                            job.is_gpu,
+                            job.preview_percent,
+                        ),
                     )
                     .await;
                     shared::decrement_active();
@@ -806,10 +908,7 @@ impl TranscodeService for TranscodeServiceHandler {
         &self,
         request: Request<TranscodeRequest>,
     ) -> Result<Response<TranscodeResponse>, Status> {
-        let mut source_cid = request.get_ref().source_cid.clone();
-        if source_cid.starts_with("s5://") {
-            source_cid = source_cid.strip_prefix("s5://").unwrap().to_string();
-        }
+        let source_cid = request.get_ref().source_cid.clone();
 
         println!("Received source_cid: {}", source_cid);
 
@@ -863,16 +962,12 @@ impl TranscodeService for TranscodeServiceHandler {
         request: Request<GetTranscodedRequest>,
     ) -> Result<Response<GetTranscodedResponse>, Status> {
         let task_id = &request.get_ref().task_id;
-        let transcoded = TRANSCODED.lock().await;
-        let entry = transcoded.get(task_id).cloned();
-
-        let (metadata, duration) =
-            entry.unwrap_or_else(|| ("Transcoding in progress".to_string(), 0.0));
+        let (status_code, metadata, duration) = job_status(task_id).await;
 
         let progress = shared::calculate_overall_progress(task_id);
 
         let response = GetTranscodedResponse {
-            status_code: 200,
+            status_code,
             metadata,
             progress,
             duration,
@@ -989,19 +1084,14 @@ struct StatusResponse {
 
 impl RestHandler {
     async fn get_transcoded(&self, task_id: String) -> Result<impl warp::Reply, warp::Rejection> {
-        // Retrieve the metadata and the progress for the given task ID.
-        let transcoded = TRANSCODED.lock().await;
-        let entry = transcoded.get(&task_id).cloned();
-
-        // Use default values if the task is not yet complete.
-        let (metadata, duration) =
-            entry.unwrap_or_else(|| ("Transcoding in progress".to_string(), 0.0));
+        // Retrieve the status and the progress for the given task ID.
+        let (status_code, metadata, duration) = job_status(&task_id).await;
 
         let progress = shared::calculate_overall_progress(&task_id);
 
         // Construct the response including the progress
         let response = GetTranscodedResponseWrapper {
-            status_code: 200,
+            status_code,
             metadata,
             progress,
             duration,
@@ -1473,7 +1563,9 @@ mod tests {
         let hold_log = region
             .find(concat!("MODERATION", " HOLD task_id="))
             .expect("hold log present");
-        let ret = region.find("return;").expect("the hold path must return");
+        let ret = region
+            .find("return Ok(());")
+            .expect("the hold path must return");
         let would = region.find("WOULD-HOLD").expect("dark log present");
         let publish = region
             .find(concat!("transcode_video_", "publish("))
@@ -1907,6 +1999,274 @@ mod tests {
         assert!(
             server_src.contains("response.status_code != 200"),
             "transcode loop must check response.status_code"
+        );
+    }
+
+    // ── Failed-job status: non-200 from GetTranscoded means permanent failure ──
+
+    fn fresh_task_id() -> String {
+        Uuid::new_v4().to_string()
+    }
+
+    #[test]
+    fn test_parse_source_cid_accepts_a_network_prefix() {
+        assert_eq!(
+            parse_source_cid("s5://abc.mp4"),
+            Ok(("abc".to_string(), "s5".to_string()))
+        );
+        assert_eq!(
+            parse_source_cid("ipfs://Qm123"),
+            Ok(("Qm123".to_string(), "ipfs".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_source_cid_rejects_bad_input_as_400() {
+        for bad in ["", "bare-cid", "s5://", "://abc"] {
+            let failure = parse_source_cid(bad).expect_err(bad);
+            assert_eq!(failure.status_code, 400, "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn test_grpc_does_not_strip_the_prefix_the_job_requires() {
+        // Stripping `s5://` left no `://`, so every S5 source sent over gRPC
+        // failed the job's own CID check.
+        let needle = concat!("strip_prefix(\"s5", "://\")");
+        assert!(!job_flow_src().contains(needle));
+    }
+
+    #[test]
+    fn test_parse_media_formats_blames_the_right_side() {
+        assert_eq!(parse_media_formats("[{\"id\":1}]", true).unwrap().len(), 1);
+        assert_eq!(
+            parse_media_formats("not json", true)
+                .unwrap_err()
+                .status_code,
+            400,
+            "formats sent by the client are bad input"
+        );
+        assert_eq!(
+            parse_media_formats("not json", false)
+                .unwrap_err()
+                .status_code,
+            500,
+            "the server's own formats file is a server fault"
+        );
+    }
+
+    #[test]
+    fn test_all_formats_failed_only_when_something_failed_and_nothing_published() {
+        assert!(all_formats_failed(0, 1));
+        assert!(!all_formats_failed(0, 0), "all cached is not a failure");
+        assert!(
+            !all_formats_failed(1, 1),
+            "partial success still returns 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_job_status_reports_a_recorded_failure() {
+        let id = fresh_task_id();
+        record_failure(
+            &id,
+            JobFailure {
+                status_code: 500,
+                reason: "Source download failed",
+            },
+        )
+        .await;
+        assert_eq!(
+            job_status(&id).await,
+            (500, "Source download failed".to_string(), 0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_job_status_unchanged_for_running_done_and_held_jobs() {
+        let running = fresh_task_id();
+        assert_eq!(
+            job_status(&running).await,
+            (200, "Transcoding in progress".to_string(), 0.0)
+        );
+        let done = fresh_task_id();
+        TRANSCODED
+            .lock()
+            .await
+            .insert(done.clone(), ("[{\"id\":1}]".to_string(), 9.5));
+        assert_eq!(
+            job_status(&done).await,
+            (200, "[{\"id\":1}]".to_string(), 9.5)
+        );
+        let held = fresh_task_id();
+        TRANSCODED
+            .lock()
+            .await
+            .insert(held.clone(), ("[]".to_string(), 5.0));
+        assert_eq!(job_status(&held).await, (200, "[]".to_string(), 5.0));
+    }
+
+    #[tokio::test]
+    async fn test_supervise_records_returned_failures_only() {
+        let failed = fresh_task_id();
+        supervise(failed.clone(), async {
+            Err(JobFailure {
+                status_code: 400,
+                reason: "Invalid source CID",
+            })
+        })
+        .await;
+        assert_eq!(job_status(&failed).await.0, 400);
+
+        let fine = fresh_task_id();
+        supervise(fine.clone(), async { Ok(()) }).await;
+        assert_eq!(job_status(&fine).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn test_supervise_turns_a_panic_into_a_500_and_survives_it() {
+        let id = fresh_task_id();
+        supervise(id.clone(), async { panic!("boom: secret-detail") }).await;
+        let (code, reason, _) = job_status(&id).await;
+        assert_eq!(code, 500);
+        assert!(
+            !reason.contains("secret-detail"),
+            "panic text must not reach API clients: {}",
+            reason
+        );
+    }
+
+    /// End to end through the real job function: the node developer's report.
+    #[tokio::test]
+    async fn test_a_cid_without_a_prefix_fails_the_job_with_400() {
+        let id = fresh_task_id();
+        supervise(
+            id.clone(),
+            process_single_job(
+                id.clone(),
+                "bare-cid".to_string(),
+                String::new(),
+                false,
+                false,
+                0,
+            ),
+        )
+        .await;
+        assert_eq!(job_status(&id).await.0, 400);
+    }
+
+    #[tokio::test]
+    async fn test_grpc_get_transcoded_returns_the_failure() {
+        let id = fresh_task_id();
+        record_failure(
+            &id,
+            JobFailure {
+                status_code: 400,
+                reason: "Invalid source CID",
+            },
+        )
+        .await;
+        let handler = TranscodeServiceHandler {
+            transcode_task_sender: None,
+        };
+        let resp = handler
+            .get_transcoded(Request::new(GetTranscodedRequest {
+                task_id: id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.status_code, 400);
+        assert_eq!(resp.metadata, "Invalid source CID");
+    }
+
+    #[tokio::test]
+    async fn test_rest_get_transcoded_returns_the_failure() {
+        let id = fresh_task_id();
+        record_failure(
+            &id,
+            JobFailure {
+                status_code: 500,
+                reason: "Source download failed",
+            },
+        )
+        .await;
+        let handler = RestHandler {
+            transcode_task_sender: None,
+        };
+        let reply = handler.get_transcoded(id).await.unwrap();
+        let bytes = hyper::body::to_bytes(warp::Reply::into_response(reply).into_body())
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status_code"], 500);
+        assert_eq!(v["metadata"], "Source download failed");
+    }
+
+    /// Wiring the pure helper's tests cannot see.
+    #[test]
+    fn test_every_format_failure_is_counted_and_checked_before_the_result() {
+        let flow = job_flow_src();
+        assert_eq!(
+            flow.matches(concat!("failed_formats", " += 1;")).count(),
+            7,
+            "serialize, parse, non-200 and Err (gate off), produce Err, and \
+             non-200 and Err (publish)"
+        );
+        let check = flow
+            .find(concat!(
+                "all_formats_failed(",
+                "transcoded_formats.len(), failed_formats)"
+            ))
+            .expect("all-formats-failed check present");
+        let insert = flow
+            .find("(transcoded_json, source_duration)")
+            .expect("result recorded");
+        assert!(check < insert, "a failed job must not record a 200 result");
+    }
+
+    /// The compiler forces every exit to name an outcome but cannot tell a
+    /// wrong `Ok` from a right one. A download or decrypt failure reporting
+    /// success would put the task back in "in progress" forever.
+    #[test]
+    fn test_only_the_moderation_hold_exits_early_as_success() {
+        let flow = job_flow_src();
+        let start = flow
+            .find("async fn process_single_job")
+            .expect("job function present");
+        let body = &flow[start..];
+        let body = &body[..body.find("\n}\n").expect("job function end")];
+        assert_eq!(body.matches(concat!("return ", "Ok(());")).count(), 1);
+        let hold = body
+            .find(concat!("MODERATION", " HOLD task_id="))
+            .expect("hold log present");
+        assert!(
+            body.find(concat!("return ", "Ok(());")).unwrap() > hold,
+            "the one early success must be the hold path"
+        );
+        assert_eq!(
+            body.matches(concat!("return ", "Err(JobFailure::server("))
+                .count(),
+            10,
+            "config, 3 download, read, decrypt, 3 store, all formats failed"
+        );
+    }
+
+    #[test]
+    fn test_the_receiver_supervises_each_job() {
+        let flow = job_flow_src();
+        let start = flow
+            .find("async fn transcode_task_receiver")
+            .expect("receiver present");
+        let body = &flow[start..];
+        let body = &body[..body.find("\n}").expect("receiver end")];
+        let sup = body.find("supervise(").expect("jobs run under supervise");
+        let dec = body
+            .find("shared::decrement_active()")
+            .expect("active count released");
+        assert!(
+            sup < dec,
+            "the active count must be released after a panic too"
         );
     }
 

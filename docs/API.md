@@ -235,7 +235,7 @@ Authorization: Bearer <JWT_TOKEN>
 
 | Field | Type | Description |
 |---|---|---|
-| `status_code` | int | HTTP status code (200) |
+| `status_code` | int | `200` while the job is running or finished. Any other value means the job has failed permanently (see [Failed Jobs](#failed-jobs)). The HTTP response itself is still 200. |
 | `metadata` | string | JSON array (as string) of transcoded format objects, each with an added `cid` field. Value is `"Transcoding in progress"` while the job is running. |
 | `progress` | int | Overall progress percentage (0-100). Averaged across all output formats. |
 | `duration` | float | Source media duration in seconds, as reported by ffprobe. `0.0` if the job has not yet completed or if ffprobe could not determine duration. |
@@ -279,9 +279,31 @@ GET /get_transcoded/{task_id}  -> progress: 45,  duration: 0.0
 GET /get_transcoded/{task_id}  -> progress: 100, duration: 125.5, metadata: "[...]"
 ```
 
-- Poll until `progress == 100`
+- Poll until `status_code != 200` (failed) or `progress == 100` (finished). Check `status_code` first, because `progress` is not meaningful on a failed job.
 - `duration` is `0.0` until the job completes
 - `metadata` is `"Transcoding in progress"` (a plain string, not JSON) until the job completes
+
+#### Failed Jobs
+
+A non-200 `status_code` is final, so stop polling and don't expect the job to recover. `metadata` holds the reason as plain text, not JSON. It is for logs and people, so don't parse it.
+
+| `status_code` | Meaning | `metadata` |
+|---|---|---|
+| `400` | Bad input. Retrying the same request cannot help. | `Invalid source CID`, `Invalid media formats` |
+| `500` | Anything else. | `Source download failed`, `Source metadata could not be read`, `Source decryption failed`, `Source could not be stored`, `All formats failed`, `Server configuration error`, `Internal error` |
+
+```json
+{
+  "status_code": 400,
+  "metadata": "Invalid source CID",
+  "progress": 0,
+  "duration": 0.0
+}
+```
+
+- **Partial success is not a failure:** if at least one format publishes, the job returns `200`, and `metadata` lists only the formats that succeeded.
+- **A moderation hold is not a failure:** it returns `200`, `metadata` `[]` and `progress` 100.
+- **Restarts:** job status is held in memory, so after a server restart an unknown `task_id` still reads as `200` and `"Transcoding in progress"`. Clients need their own overall timeout for this case.
 
 ---
 
