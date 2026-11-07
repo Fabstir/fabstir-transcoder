@@ -13,6 +13,7 @@ The Fabstir Transcoder exposes a REST API on port **8000** and a gRPC API on por
   - [GET /status](#get-status)
   - [POST /transcode](#post-transcode)
   - [GET /get_transcoded/{task_id}](#get-get_transcodedtask_id)
+  - [POST /transcode/{task_id}/cancel](#post-transcodetask_idcancel)
 - [gRPC API](#grpc-api)
   - [Transcode](#rpc-transcode)
   - [GetTranscoded](#rpc-gettranscoded)
@@ -250,7 +251,7 @@ Authorization: Bearer <JWT_TOKEN>
 | `status_code` | int | `200` while the job is queued, running or finished. Any other value means the job has failed permanently or isn't known here (see [Failed Jobs](#failed-jobs)). The HTTP response itself is still 200. |
 | `metadata` | string | JSON array (as string) of transcoded format objects, each with an added `cid` field. Value is `"Transcoding in progress"` while the job is running. |
 | `progress` | int | Overall progress percentage, averaged across all output formats. A running job stays at 99 or below, including while it is being moderated and uploaded. 100 means the job has finished and its result is in `metadata`. |
-| `duration` | float | Source media duration in seconds, as reported by ffprobe. Available as soon as the source has been downloaded, and from then on in every response, including for a job that later fails. `0.0` means not known: the job is still queued or downloading, or ffprobe could not determine the duration. |
+| `duration` | float | Media duration in seconds. **While the job runs** it is an estimate: what the source's header claims, available as soon as the source has been downloaded and probed. **Once the job has finished** it is the length really encoded: the longest output delivered, measured from the output itself, so a source can't fake it. A job with only trimmed formats therefore reports the trimmed length. A failed job keeps the estimate. `0.0` means not known: the job is still queued or downloading, or the file couldn't be probed. |
 
 **Metadata Format (parsed)**
 
@@ -292,7 +293,7 @@ GET /get_transcoded/{task_id}  -> progress: 100, duration: 125.5, metadata: "[..
 ```
 
 - Poll until `status_code != 200` (failed) or `progress == 100` (finished). Check `status_code` first, because `progress` is not meaningful on a failed job.
-- `duration` is `0.0` until the source has been downloaded and probed, and doesn't change after that
+- `duration` is `0.0` until the source has been downloaded and probed. It then holds still until the job finishes, when it becomes the measured length. For an honest file the two differ by milliseconds. A real difference is logged as `DURATION MISMATCH`.
 - `metadata` is `"Transcoding in progress"` (a plain string, not JSON) until the job completes
 
 #### Failed Jobs
@@ -302,6 +303,7 @@ A non-200 `status_code` is final, so stop polling and don't expect the job to re
 | `status_code` | Meaning | `metadata` |
 |---|---|---|
 | `400` | Bad input. Retrying the same request cannot help. | `Invalid source CID`, `Invalid media formats` |
+| `499` | Cancelled by a client (see [POST /transcode/{task_id}/cancel](#post-transcodetask_idcancel)). | `Job cancelled` |
 | `404` | This server has no record of the task. It may never have been accepted, it may have ended more than `JOB_RECORD_TTL_SECS` ago, or the server has restarted since. Submit the job again if it is still needed. | `Unknown task` |
 | `500` | Anything else. | `Source download failed`, `Source metadata could not be read`, `Source decryption failed`, `Source could not be stored`, `All formats failed`, `Job timed out`, `Server configuration error`, `Internal error` |
 
@@ -317,6 +319,34 @@ A non-200 `status_code` is final, so stop polling and don't expect the job to re
 - **Partial success is not a failure:** if at least one format publishes, the job returns `200`, and `metadata` lists only the formats that succeeded.
 - **A moderation hold is not a failure:** it returns `200`, `metadata` `[]` and `progress` 100.
 - **Restarts:** jobs and their status are held in memory, so a server restart loses every queued and running job, and they then read as `404`. The server doesn't restart them, so the client needs to submit them again.
+
+### POST /transcode/{task_id}/cancel
+
+Stop a job. A running job's FFmpeg is killed and its temporary files are removed, and its slot goes to the next job. A queued job never starts. An S5 or IPFS upload already under way can't be interrupted: it finishes in the background and its result is ignored.
+
+**Request**
+
+```
+POST /transcode/{task_id}/cancel
+Authorization: Bearer <JWT_TOKEN>
+```
+
+**Response** `200 OK`
+
+```json
+{
+  "status_code": 200,
+  "message": "Job cancelled",
+  "task_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+| Case | HTTP status | `message` | What `GetTranscoded` reports after |
+|---|---|---|---|
+| Queued or running | 200 | `Job cancelled` | `status_code` 499, `Job cancelled`, straight away |
+| Already finished or failed | 200 | `Job had already ended` | No change: a finished job's result stays available |
+| Cancelled twice | 200 | `Job cancelled`, or `Job had already ended` once it has stopped | `status_code` 499 |
+| Unknown task | 404 | `Unknown task` | `status_code` 404 |
 
 ---
 
@@ -441,6 +471,7 @@ One job can't stop the others:
 - **A failure or panic** ends that job with a `500`, and the next one starts.
 - **A stuck FFmpeg** is killed once its media clock has stood still for `FFMPEG_STALL_TIMEOUT_SECS` (default: 15 minutes). The format fails, and any others carry on.
 - **A job stuck anywhere else** is stopped at `JOB_DEADLINE_SECS` (default: 24 hours) and reads as `Job timed out`.
+- **A job nobody is waiting for** can be stopped with [`POST /transcode/{task_id}/cancel`](#post-transcodetask_idcancel).
 - **If the queue or cleanup task dies,** it restarts, and the jobs waiting in the queue stay there.
 - **If a listening port is lost,** the server exits so that the container's restart policy can bring it back. Queued and running jobs are lost in this case, as they are in any restart (see [Failed Jobs](#failed-jobs)).
 

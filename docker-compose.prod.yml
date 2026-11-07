@@ -11,6 +11,7 @@
 #
 # REST Endpoints:
 #   POST /transcode?source_cid=...&media_formats=...&is_encrypted=...&is_gpu=...
+#   POST /transcode/{task_id}/cancel
 #   GET  /get_transcoded/{task_id}
 #        Response: { "status_code": 200, "metadata": "...", "progress": 0-100, "duration": <seconds> }
 #        Any non-200 status_code = job failed permanently, or the server doesn't know

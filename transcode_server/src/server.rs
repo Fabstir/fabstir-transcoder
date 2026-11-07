@@ -82,8 +82,12 @@ static PATH_TO_TRANSCODED_FILE: Lazy<String> = Lazy::new(|| {
 #[derive(Default)]
 struct JobRecord {
     ended_at: Option<Instant>,
-    /// Seconds, or 0.0 until the source has been probed.
+    /// Seconds, or 0.0 until the source has been probed. What the source claims, so
+    /// only an estimate: the result carries the length that was really encoded.
     source_duration: f64,
+    cancel_requested: bool,
+    /// Wakes the job's supervisor. It stays set if nothing is waiting yet.
+    cancel_signal: Arc<tokio::sync::Notify>,
 }
 
 /// Every job this process has accepted. A task missing from here was never
@@ -274,6 +278,14 @@ impl JobFailure {
             reason,
         }
     }
+
+    /// A client asked for this, so it's neither its mistake nor a server fault.
+    fn cancelled() -> Self {
+        JobFailure {
+            status_code: 499,
+            reason: "Job cancelled",
+        }
+    }
 }
 
 /// Split `network://cid[.ext]` into the bare CID and the network name.
@@ -374,6 +386,23 @@ async fn job_status(task_id: &str) -> (i32, String, f64) {
     }
 }
 
+/// How long to wait for a stopped job to let go of its files and its FFmpeg, before
+/// giving up its slot anyway.
+const STOP_WAIT: Duration = Duration::from_secs(10);
+
+async fn stop_job(handle: &mut tokio::task::JoinHandle<std::result::Result<(), JobFailure>>) {
+    handle.abort();
+    let _ = tokio::time::timeout(STOP_WAIT, handle).await;
+}
+
+/// Waits for a job to be cancelled. A job with no record can't be.
+async fn cancelled(signal: Option<Arc<tokio::sync::Notify>>) {
+    match signal {
+        Some(signal) => signal.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Run a job so that every way it can end is reported. Its own task isolates a
 /// panic, and the deadline stops a job stuck for good, so the caller always gets
 /// its slot back. Stopping the job drops its FFmpeg child, which kills it.
@@ -381,27 +410,89 @@ async fn supervise<F>(task_id: String, deadline: Duration, job: F)
 where
     F: std::future::Future<Output = std::result::Result<(), JobFailure>> + Send + 'static,
 {
+    let (signal, cancelled_while_queued) = match job_records().get(&task_id) {
+        Some(record) => (Some(record.cancel_signal.clone()), record.cancel_requested),
+        None => (None, false),
+    };
+    if cancelled_while_queued {
+        mark_job_ended(&task_id);
+        return;
+    }
+
     let mut handle = tokio::spawn(job);
-    let failure = match tokio::time::timeout(deadline, &mut handle).await {
-        Ok(Ok(Ok(()))) => None,
-        Ok(Ok(Err(failure))) => Some(failure),
-        Ok(Err(e)) => {
-            eprintln!("Job panicked: task_id={} error={:?}", task_id, e);
-            Some(JobFailure::server("Internal error"))
-        }
-        Err(_) => {
-            handle.abort();
-            eprintln!(
-                "Job stopped after reaching its deadline of {:?}: task_id={}",
-                deadline, task_id
-            );
-            Some(JobFailure::server("Job timed out"))
+    let failure = tokio::select! {
+        finished = tokio::time::timeout(deadline, &mut handle) => match finished {
+            Ok(Ok(Ok(()))) => None,
+            Ok(Ok(Err(failure))) => Some(failure),
+            Ok(Err(e)) => {
+                eprintln!("Job panicked: task_id={} error={:?}", task_id, e);
+                Some(JobFailure::server("Internal error"))
+            }
+            Err(_) => {
+                eprintln!(
+                    "Job stopped after reaching its deadline of {:?}: task_id={}",
+                    deadline, task_id
+                );
+                stop_job(&mut handle).await;
+                Some(JobFailure::server("Job timed out"))
+            }
+        },
+        _ = cancelled(signal) => {
+            println!("Job cancelled: task_id={}", task_id);
+            stop_job(&mut handle).await;
+            None // `cancel_job` has recorded it already.
         }
     };
     if let Some(failure) = failure {
         record_failure(&task_id, failure).await;
     }
     mark_job_ended(&task_id);
+}
+
+#[derive(Debug, PartialEq)]
+enum CancelOutcome {
+    Cancelled,
+    AlreadyEnded,
+    Unknown,
+}
+
+/// Stops a job, or makes sure a queued one never starts. Its status changes at once,
+/// and its slot comes back as soon as its FFmpeg has been stopped and its files removed.
+/// An upload already under way can't be interrupted, and finishes in the background
+/// with its result ignored.
+async fn cancel_job(task_id: &str) -> CancelOutcome {
+    let signal = {
+        let mut records = job_records();
+        let Some(record) = records.get_mut(task_id) else {
+            return CancelOutcome::Unknown;
+        };
+        if record.ended_at.is_some() {
+            return CancelOutcome::AlreadyEnded;
+        }
+        record.cancel_requested = true;
+        record.cancel_signal.clone()
+    };
+    record_failure(task_id, JobFailure::cancelled()).await;
+    signal.notify_one();
+    CancelOutcome::Cancelled
+}
+
+/// `POST /transcode/{task_id}/cancel`. Nothing to cancel still counts as success, apart
+/// from a task this server has never heard of.
+fn cancel_reply(task_id: String, outcome: CancelOutcome) -> warp::reply::Response {
+    use warp::Reply;
+
+    let (http_status, status_code, message) = match outcome {
+        CancelOutcome::Cancelled => (warp::http::StatusCode::OK, 200, "Job cancelled"),
+        CancelOutcome::AlreadyEnded => (warp::http::StatusCode::OK, 200, "Job had already ended"),
+        CancelOutcome::Unknown => (warp::http::StatusCode::NOT_FOUND, 404, "Unknown task"),
+    };
+    let response = TranscodeResponseWrapper {
+        status_code,
+        message: message.to_string(),
+        task_id,
+    };
+    warp::reply::with_status(warp::reply::json(&response), http_status).into_response()
 }
 
 /// Keep a background task alive: if it dies, log it and start it again.
@@ -547,6 +638,16 @@ async fn fetch_source(
     })
 }
 
+/// The duration a finished job reports: what was encoded, or what the source claims if
+/// nothing could be measured.
+fn result_duration(encoded: f64, source: f64) -> f64 {
+    if encoded > 0.0 {
+        encoded
+    } else {
+        source
+    }
+}
+
 /// Runs one job from start to finish: download, transcode, moderate if the gate is
 /// armed, publish, and record the result. `gate` and `client` are parameters so that
 /// tests can run the whole thing without a node.
@@ -605,10 +706,13 @@ async fn process_single_job(
 
     // As soon as the source is here, and reported from now on: the node works out its
     // billing steps from this, and can prove nothing while it reads 0.0.
-    let mut source_duration = transcode_video::get_video_duration(&file_path)
+    let source_duration = transcode_video::get_video_duration(&file_path)
         .await
         .unwrap_or(0.0);
     set_source_duration(&task_id, source_duration);
+    // That's only what the file claims. The node bills from the value in the result, so
+    // that one is the length really encoded: the longest output delivered.
+    let mut encoded_duration: f64 = 0.0;
 
     // ── M3 shadow moderation (D1/D4): fire-and-forget, concurrent with the
     //    transcode loop below; incapable of delaying, failing, or blocking
@@ -685,9 +789,7 @@ async fn process_single_job(
                 match transcode_result {
                     Ok(transcode_video_response) => {
                         let response = transcode_video_response.into_inner();
-                        if source_duration == 0.0 && response.duration > 0.0 {
-                            source_duration = response.duration;
-                        }
+                        encoded_duration = encoded_duration.max(response.duration);
                         println!(
                             "Response: status_code: {}, message: {}",
                             response.status_code, response.message
@@ -848,11 +950,11 @@ async fn process_single_job(
             if gate.holds() {
                 // ── HOLD: upload nothing; discard local temp; record held status ──
                 eprintln!("MODERATION HOLD task_id={} outcome={:?}", task_id, outcome);
-                let held_duration = if source_duration > 0.0 {
-                    source_duration
-                } else {
-                    pending.first().map(|o| o.total_duration).unwrap_or(0.0)
-                };
+                let longest_held = pending
+                    .iter()
+                    .map(|out| out.encoded_duration)
+                    .fold(0.0, f64::max);
+                let held_duration = result_duration(longest_held, source_duration);
                 for out in &pending {
                     if out.is_hls {
                         let _ = fs::remove_dir_all(held_output_path(out));
@@ -887,9 +989,7 @@ async fn process_single_job(
             match transcode_video_publish(out).await {
                 Ok(resp) => {
                     let response = resp.into_inner();
-                    if source_duration == 0.0 && response.duration > 0.0 {
-                        source_duration = response.duration;
-                    }
+                    encoded_duration = encoded_duration.max(response.duration);
                     if response.status_code != 200 {
                         eprintln!(
                             "Publish failed with status {}: {}",
@@ -921,7 +1021,8 @@ async fn process_single_job(
     });
 
     let mut transcoded = TRANSCODED.lock().await;
-    transcoded.insert(task_id.clone(), (transcoded_json, source_duration));
+    let result_duration = result_duration(encoded_duration, source_duration);
+    transcoded.insert(task_id.clone(), (transcoded_json, result_duration));
     drop(transcoded);
 
     // Only now, with the result in place: clients read 100 as "finished".
@@ -1611,6 +1712,16 @@ fn rest_routes(
         .with(cors.clone())
         .boxed();
 
+    let cancel = warp::path!("transcode" / String / "cancel")
+        .and(warp::post())
+        .and(auth::with_auth())
+        .and_then(|task_id: String| async move {
+            let outcome = cancel_job(&task_id).await;
+            Ok::<_, warp::Rejection>(cancel_reply(task_id, outcome))
+        })
+        .with(cors.clone())
+        .boxed();
+
     let get_transcoded_handler = Arc::clone(&rest_handler);
     let get_transcoded = warp::path!("get_transcoded" / String)
         .and(auth::with_auth()) // Apply JWT authentication middleware
@@ -1641,6 +1752,7 @@ fn rest_routes(
     health
         .or(status)
         .or(transcode)
+        .or(cancel)
         .or(get_transcoded)
         .recover(auth::handle_rejection)
 }
@@ -2020,7 +2132,7 @@ mod tests {
             dest: None,
             encrypt_flag: false,
             is_hls: false,
-            total_duration: 1.0,
+            encoded_duration: 1.0,
             preview_percent: 0,
             video_format: json!({}),
             local_file,
@@ -2803,7 +2915,7 @@ mod tests {
             ))
             .expect("all-formats-failed check present");
         let insert = flow
-            .find("(transcoded_json, source_duration)")
+            .find("(transcoded_json, result_duration)")
             .expect("result recorded");
         assert!(check < insert, "a failed job must not record a 200 result");
     }
@@ -2832,8 +2944,8 @@ mod tests {
     // ── Whole jobs: real FFmpeg against the fake portal ─────────────────────
 
     use crate::test_support::{
-        fresh_cid, have_ffmpeg, outputs_containing, portal, sample_audio, sample_video,
-        sample_with_a_false_duration, sources_containing, Fault, UPLOAD_TEST_LOCK,
+        fresh_cid, have_ffmpeg, outputs_containing, portal, sample_audio, sample_claiming_to_last,
+        sample_slow_to_encode, sample_video, sources_containing, Fault, UPLOAD_TEST_LOCK,
     };
 
     const SMALL: &str =
@@ -3261,7 +3373,7 @@ mod tests {
     }
 
     /// Polls a real job as a client would, and returns what it saw.
-    async fn watch_job(source: String, gate: GateMode) -> Vec<(i32, String, f64)> {
+    async fn watch_job(source: String, formats: &str, gate: GateMode) -> Vec<(i32, String, f64)> {
         let id = fresh_task_id();
         register_job(&id);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3281,7 +3393,7 @@ mod tests {
             process_single_job(
                 id.clone(),
                 source,
-                SMALL.to_string(),
+                formats.to_string(),
                 false,
                 false,
                 0,
@@ -3298,8 +3410,8 @@ mod tests {
         seen
     }
 
-    /// What the node dev asked for: the real value from early in the run, the same
-    /// value at the end, and never a real value that later goes back to 0.0.
+    /// The value from early in the run, which holds still until the result arrives, and
+    /// a real value never goes back to 0.0.
     #[tokio::test]
     async fn test_a_real_job_reports_its_duration_from_early_on_until_the_end() {
         if !have_ffmpeg() {
@@ -3308,7 +3420,7 @@ mod tests {
         let _uploads = UPLOAD_TEST_LOCK.lock().await;
         for gate in [GateMode::Off, GateMode::Enforce] {
             let (source, _) = serve_source(sample_video());
-            let seen = watch_job(source, gate).await;
+            let seen = watch_job(source, SMALL, gate).await;
 
             let early = seen
                 .iter()
@@ -3324,17 +3436,464 @@ mod tests {
                 early.0
             );
 
-            let (_, last_metadata, last_duration) = seen.last().unwrap();
-            assert!(last_metadata.starts_with("[{"), "{}", last_metadata);
-            assert_eq!(*last_duration, early.2, "the value must not change");
-
             let first_real = seen.iter().position(|(_, _, d)| *d > 0.0).unwrap();
+            for (_, metadata, duration) in &seen[first_real..] {
+                if metadata == "Transcoding in progress" {
+                    assert_eq!(*duration, early.2, "{:?}: the estimate moved", gate);
+                } else {
+                    assert!(is_about_three_seconds(*duration), "{}", duration);
+                }
+            }
             assert!(
-                seen[first_real..].iter().all(|(_, _, d)| *d == early.2),
-                "{:?}: the duration moved after it first appeared",
-                gate
+                seen.last().unwrap().1.starts_with("[{"),
+                "{:?}",
+                seen.last()
             );
         }
+    }
+
+    // ── The final duration is measured: the node bills from it ─────────────
+
+    fn is_about(duration: f64, expected: f64) -> bool {
+        (duration - expected).abs() < 1.0
+    }
+
+    /// A header claiming 4 s on a 120 s file used to bill 4 s.
+    #[tokio::test]
+    async fn test_a_file_claiming_to_be_short_reports_its_real_length_at_the_end() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let _uploads = UPLOAD_TEST_LOCK.lock().await;
+        let (source, _) = serve_source(&sample_claiming_to_last(4.0));
+        let seen = watch_job(source, SMALL, GateMode::Off).await;
+        let running = seen.iter().find(|(_, _, d)| *d > 0.0).unwrap();
+        assert!(
+            is_about(running.2, 4.0),
+            "the estimate is the claim: {}",
+            running.2
+        );
+        let last = seen.last().unwrap();
+        assert!(last.1.starts_with("[{"), "{:?}", last);
+        assert!(
+            is_about(last.2, 120.0),
+            "must bill what was encoded: {}",
+            last.2
+        );
+    }
+
+    /// The one the frame cap can't catch: a header claiming 10 hours on a 120 s file
+    /// used to bill up to the deposit.
+    #[tokio::test]
+    async fn test_a_file_claiming_to_be_long_reports_its_real_length_at_the_end() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let _uploads = UPLOAD_TEST_LOCK.lock().await;
+        for gate in [GateMode::Off, GateMode::Enforce] {
+            let (source, _) = serve_source(&sample_claiming_to_last(36000.0));
+            let seen = watch_job(source, SMALL, gate).await;
+            let running = seen.iter().find(|(_, _, d)| *d > 0.0).unwrap();
+            assert!(is_about(running.2, 36000.0), "{:?}: {}", gate, running.2);
+            let last = seen.last().unwrap();
+            assert!(last.1.starts_with("[{"), "{:?}: {:?}", gate, last);
+            assert!(
+                is_about(last.2, 120.0),
+                "{:?}: must not bill the claim: {}",
+                gate,
+                last.2
+            );
+        }
+    }
+
+    /// Only part of the source got encoded, so only that part counts.
+    #[tokio::test]
+    async fn test_a_trimmed_job_reports_the_length_it_encoded() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let _uploads = UPLOAD_TEST_LOCK.lock().await;
+        let trimmed =
+            r#"[{"id":1,"ext":"mp4","vcodec":"libx264","vf":"scale=32:32","trim_percent":50}]"#;
+        // The moderation tap keeps reading after the trim point, so FFmpeg's own
+        // clock would say 3 s here. The file says 1.5 s.
+        for gate in [GateMode::Off, GateMode::Enforce] {
+            let (source, _) = serve_source(sample_video());
+            let (client, _) = recording(ModerationOutcome::Cleared);
+            let end = run_job_with(&source, trimmed, false, gate, client).await;
+            assert_eq!(end.status_code, 200, "{}", end.metadata);
+            assert!(
+                (end.duration - 1.5).abs() < 0.3,
+                "{:?}: {}",
+                gate,
+                end.duration
+            );
+        }
+    }
+
+    /// A full rendition and a short preview: the job encoded the whole source.
+    #[tokio::test]
+    async fn test_the_longest_output_sets_the_length_whatever_order_they_come_in() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let _uploads = UPLOAD_TEST_LOCK.lock().await;
+        let full = r#"{"id":1,"ext":"mp4","vcodec":"libx264","vf":"scale=32:32"}"#;
+        let preview =
+            r#"{"id":2,"ext":"mp4","vcodec":"libx264","vf":"scale=16:16","trim_percent":20}"#;
+        for formats in [
+            format!("[{},{}]", full, preview),
+            format!("[{},{}]", preview, full),
+        ] {
+            // The gate publishes through a different path, which has to agree.
+            for gate in [GateMode::Off, GateMode::Enforce] {
+                let (source, _) = serve_source(sample_video());
+                let (client, _) = recording(ModerationOutcome::Cleared);
+                let end = run_job_with(&source, &formats, false, gate, client).await;
+                assert_eq!(end.status_code, 200, "{}", end.metadata);
+                assert!(
+                    is_about_three_seconds(end.duration),
+                    "{:?}: {}",
+                    gate,
+                    end.duration
+                );
+            }
+        }
+    }
+
+    /// Only what gets delivered counts.
+    #[tokio::test]
+    async fn test_a_failed_format_does_not_count_towards_the_length() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let _uploads = UPLOAD_TEST_LOCK.lock().await;
+        let (source, _) = serve_source(sample_video());
+        let formats = r#"[{"id":1,"ext":"mp4","vcodec":"no_such_encoder"},
+                          {"id":2,"ext":"mp4","vcodec":"libx264","vf":"scale=16:16","trim_percent":50}]"#;
+        let end = run_job(&source, formats).await;
+        assert_eq!(end.status_code, 200, "{}", end.metadata);
+        assert!((end.duration - 1.5).abs() < 0.3, "{}", end.duration);
+    }
+
+    #[tokio::test]
+    async fn test_an_hls_job_reports_the_length_of_its_segments() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let _uploads = UPLOAD_TEST_LOCK.lock().await;
+        let (source, _) = serve_source(&sample_claiming_to_last(36000.0));
+        let hls = r#"[{"id":1,"ext":"mp4","vcodec":"libx264","hls":true,"hls_time":10}]"#;
+        let end = run_job(&source, hls).await;
+        assert_eq!(end.status_code, 200, "{}", end.metadata);
+        // FFmpeg's segment lengths run a little over at this sample's 2 frames a second,
+        // and are exact at normal frame rates. What matters here is that 36000 s is gone.
+        assert!((end.duration - 120.0).abs() <= 2.0, "{}", end.duration);
+    }
+
+    /// A hold reports what was encoded too, whatever the file claimed.
+    #[tokio::test]
+    async fn test_a_held_job_reports_the_length_it_encoded() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let _uploads = UPLOAD_TEST_LOCK.lock().await;
+        let (source, _) = serve_source(&sample_claiming_to_last(36000.0));
+        let (client, _) = recording(ModerationOutcome::Blocked);
+        let end = run_job_with(&source, SMALL, false, GateMode::Enforce, client).await;
+        assert_eq!((end.status_code, end.metadata.as_str()), (200, "[]"));
+        assert!(is_about(end.duration, 120.0), "{}", end.duration);
+    }
+
+    // ── Cancelling ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_cancelling_a_running_job_stops_it_and_the_next_job_runs() {
+        let _serial = shared::COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (sender, receiver) = mpsc::channel(10);
+        let ran: Ran = Arc::default();
+        tokio::spawn(run_job_queue(
+            Arc::new(Mutex::new(receiver)),
+            slots(1),
+            std::time::Duration::from_secs(60),
+            scripted_job(ran.clone()),
+        ));
+        let (running, next) = (fresh_task_id(), fresh_task_id());
+        enqueue(&sender, queue_job(&running, "hang")).unwrap();
+        enqueue(&sender, queue_job(&next, "ok")).unwrap();
+        let started = ran.clone();
+        let expected = running.clone();
+        eventually("the first job to start", move || {
+            started.lock().unwrap().contains(&expected)
+        })
+        .await;
+
+        assert_eq!(cancel_job(&running).await, CancelOutcome::Cancelled);
+
+        assert_eq!(
+            job_status(&running).await,
+            (499, "Job cancelled".to_string(), 0.0),
+            "the status changes at once"
+        );
+        let started = ran.clone();
+        let expected = next.clone();
+        eventually("the next job to get the slot", move || {
+            started.lock().unwrap().contains(&expected)
+        })
+        .await;
+        wait_until_no_job_is_active().await;
+        assert_eq!(job_status(&next).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn test_a_job_cancelled_while_queued_never_starts() {
+        let _serial = shared::COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        shared::QUEUED_JOBS.store(0, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel(10);
+        let ran: Ran = Arc::default();
+        tokio::spawn(run_job_queue(
+            Arc::new(Mutex::new(receiver)),
+            slots(1),
+            std::time::Duration::from_secs(60),
+            scripted_job(ran.clone()),
+        ));
+        let (running, queued, last) = (fresh_task_id(), fresh_task_id(), fresh_task_id());
+        enqueue(&sender, queue_job(&running, "hang")).unwrap();
+        enqueue(&sender, queue_job(&queued, "ok")).unwrap();
+        enqueue(&sender, queue_job(&last, "ok")).unwrap();
+        let started = ran.clone();
+        let expected = running.clone();
+        eventually("the first job to start", move || {
+            started.lock().unwrap().contains(&expected)
+        })
+        .await;
+
+        assert_eq!(cancel_job(&queued).await, CancelOutcome::Cancelled);
+        assert_eq!(job_status(&queued).await.0, 499);
+        assert_eq!(cancel_job(&running).await, CancelOutcome::Cancelled);
+
+        let started = ran.clone();
+        let expected = last.clone();
+        eventually("the last job to run", move || {
+            started.lock().unwrap().contains(&expected)
+        })
+        .await;
+        assert!(
+            !ran.lock().unwrap().contains(&queued),
+            "it must never start"
+        );
+        wait_until_no_job_is_active().await;
+        assert_eq!(
+            shared::queued_jobs(),
+            0,
+            "and its place in the queue is given back"
+        );
+    }
+
+    /// On several threads a spawned job can start at once, so only the check before it
+    /// is spawned can keep it from beginning a download.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_a_job_already_cancelled_is_never_even_started() {
+        for _ in 0..200 {
+            let id = fresh_task_id();
+            register_job(&id);
+            assert_eq!(cancel_job(&id).await, CancelOutcome::Cancelled);
+            let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = started.clone();
+            supervise(id.clone(), LONG_DEADLINE, async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+            assert!(!started.load(Ordering::SeqCst), "it ran");
+            assert_eq!(job_status(&id).await.0, 499);
+        }
+    }
+
+    /// The same promise as for a job past its deadline.
+    #[tokio::test]
+    async fn test_a_cancelled_job_has_let_go_before_its_slot_comes_back() {
+        struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = SetOnDrop(stopped.clone());
+        let id = fresh_task_id();
+        register_job(&id);
+        let supervised = supervise(id.clone(), LONG_DEADLINE, async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let cancelling = async {
+            tokio::task::yield_now().await;
+            cancel_job(&id).await
+        };
+        let (_, outcome) = tokio::join!(supervised, cancelling);
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the job must be gone by now"
+        );
+    }
+
+    /// Cancelling after the event changes nothing: the result stays available.
+    #[tokio::test]
+    async fn test_cancelling_a_job_that_has_ended_changes_nothing() {
+        let done = fresh_task_id();
+        register_job(&done);
+        TRANSCODED
+            .lock()
+            .await
+            .insert(done.clone(), ("[{\"id\":1}]".to_string(), 9.5));
+        mark_job_ended(&done);
+        assert_eq!(cancel_job(&done).await, CancelOutcome::AlreadyEnded);
+        assert_eq!(
+            job_status(&done).await,
+            (200, "[{\"id\":1}]".to_string(), 9.5)
+        );
+
+        let failed = fresh_task_id();
+        register_job(&failed);
+        record_failure(&failed, JobFailure::server("All formats failed")).await;
+        mark_job_ended(&failed);
+        assert_eq!(cancel_job(&failed).await, CancelOutcome::AlreadyEnded);
+        assert_eq!(job_status(&failed).await.1, "All formats failed");
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_a_task_nobody_knows_is_reported_as_unknown() {
+        let id = fresh_task_id();
+        assert_eq!(cancel_job(&id).await, CancelOutcome::Unknown);
+        assert_eq!(job_status(&id).await.0, 404, "and it doesn't become known");
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_twice_is_harmless() {
+        let id = fresh_task_id();
+        register_job(&id);
+        assert_eq!(cancel_job(&id).await, CancelOutcome::Cancelled);
+        assert_eq!(cancel_job(&id).await, CancelOutcome::Cancelled);
+        assert_eq!(job_status(&id).await.0, 499);
+    }
+
+    /// A job that keeps its duration still reports it after being cancelled.
+    #[tokio::test]
+    async fn test_a_cancelled_job_keeps_its_duration() {
+        let id = fresh_task_id();
+        register_job(&id);
+        set_source_duration(&id, 125.5);
+        cancel_job(&id).await;
+        assert_eq!(job_status(&id).await.2, 125.5);
+    }
+
+    /// Through the real route, with a real token, as the node calls it.
+    #[tokio::test]
+    async fn test_the_cancel_route_answers_as_documented() {
+        let routes = rest_routes(Arc::new(RestHandler {
+            transcode_task_sender: mpsc::channel(1).0,
+        }));
+        let token = format!("Bearer {}", crate::auth::tests::valid_token());
+        let call = |method: &'static str, path: String, token: Option<String>| {
+            let mut request = warp::test::request().method(method).path(&path);
+            if let Some(token) = token {
+                request = request.header("authorization", token);
+            }
+            request.reply(&routes)
+        };
+        let body = |bytes: &[u8]| -> Value { serde_json::from_slice(bytes).unwrap() };
+
+        let id = fresh_task_id();
+        register_job(&id);
+        let path = format!("/transcode/{}/cancel", id);
+
+        assert_eq!(call("POST", path.clone(), None).await.status(), 401);
+        assert_eq!(job_status(&id).await.0, 200, "no token, no cancel");
+        assert_eq!(
+            call("GET", path.clone(), Some(token.clone()))
+                .await
+                .status(),
+            405
+        );
+        assert_eq!(job_status(&id).await.0, 200, "only POST cancels");
+
+        let response = call("POST", path.clone(), Some(token.clone())).await;
+        assert_eq!(response.status(), 200);
+        let v = body(response.body());
+        assert_eq!(v["status_code"], 200);
+        assert_eq!(v["message"], "Job cancelled");
+        assert_eq!(v["task_id"].as_str(), Some(id.as_str()));
+        assert_eq!(job_status(&id).await.0, 499);
+
+        mark_job_ended(&id);
+        let response = call("POST", path, Some(token.clone())).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(body(response.body())["message"], "Job had already ended");
+
+        let unknown = format!("/transcode/{}/cancel", fresh_task_id());
+        let response = call("POST", unknown, Some(token)).await;
+        assert_eq!(response.status(), 404);
+        assert_eq!(body(response.body())["message"], "Unknown task");
+    }
+
+    /// The whole thing, with a real FFmpeg in the middle of an encode.
+    #[tokio::test]
+    async fn test_cancelling_a_real_encode_kills_ffmpeg_and_removes_its_files() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let (source, _) = serve_source(sample_slow_to_encode());
+        let id = fresh_task_id();
+        register_job(&id);
+        let slow = r#"[{"id":1,"ext":"mp4","vcodec":"libx264","vf":"scale=1280:720"}]"#;
+        let job = tokio::spawn(supervise(
+            id.clone(),
+            LONG_DEADLINE,
+            process_single_job(
+                id.clone(),
+                source,
+                slow.to_string(),
+                false,
+                false,
+                0,
+                GateMode::Off,
+                Box::new(StubModerationClient {
+                    outcome: ModerationOutcome::Cleared,
+                }),
+            ),
+        ));
+        let writing = id.clone();
+        eventually("FFmpeg to start writing", move || {
+            !outputs_containing(&writing).is_empty()
+        })
+        .await;
+
+        assert_eq!(cancel_job(&id).await, CancelOutcome::Cancelled);
+        tokio::time::timeout(std::time::Duration::from_secs(15), job)
+            .await
+            .expect("the job must end promptly")
+            .unwrap();
+
+        assert_eq!(job_status(&id).await.0, 499);
+        let (gone, running) = (id.clone(), id.clone());
+        eventually("its files to go", move || {
+            outputs_containing(&gone).is_empty()
+        })
+        .await;
+        eventually("FFmpeg to die", move || {
+            !std::process::Command::new("pgrep")
+                .args(["-f", &running])
+                .status()
+                .map_or(false, |status| status.success())
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -3761,7 +4320,7 @@ mod tests {
             return;
         }
         let _uploads = UPLOAD_TEST_LOCK.lock().await;
-        let (source, _) = serve_source(&sample_with_a_false_duration());
+        let (source, _) = serve_source(&sample_claiming_to_last(4.0));
         let before = portal().uploads().len();
         let (client, frames) = recording(ModerationOutcome::Cleared);
         let end = run_job_with(
@@ -4005,10 +4564,12 @@ mod tests {
             },
         )
         .await;
-        eventually("the hung job to be stopped, freeing its FFmpeg", || {
-            stopped.load(Ordering::SeqCst)
-        })
-        .await;
+        // Already, not eventually: the slot must not go to the next job while this one
+        // still has its FFmpeg, its GPU session and its files.
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the job must be gone by now"
+        );
         assert_eq!(job_status(&id).await.0, 500);
     }
 
@@ -4269,7 +4830,7 @@ mod tests {
         let long_ago = Instant::now() - std::time::Duration::from_secs(100);
         let record = |ended_at| JobRecord {
             ended_at,
-            source_duration: 0.0,
+            ..Default::default()
         };
         let mut records = HashMap::from([
             ("old".to_string(), record(Some(long_ago))),

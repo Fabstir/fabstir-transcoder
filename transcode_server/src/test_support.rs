@@ -134,8 +134,8 @@ pub fn sample_audio() -> &'static [u8] {
     &SAMPLE
 }
 
-/// A 120 second MKV whose header claims it lasts 4 seconds.
-pub fn sample_with_a_false_duration() -> Vec<u8> {
+/// A 120 second MKV whose header claims it lasts `claimed_seconds`.
+pub fn sample_claiming_to_last(claimed_seconds: f64) -> Vec<u8> {
     let mut bytes = generate(
         &[
             "-f",
@@ -160,7 +160,7 @@ pub fn sample_with_a_false_duration() -> Vec<u8> {
         .windows(3)
         .position(|w| w == [0x44, 0x89, 0x88])
         .expect("Duration element");
-    bytes[at + 3..at + 11].copy_from_slice(&4000f64.to_be_bytes());
+    bytes[at + 3..at + 11].copy_from_slice(&(claimed_seconds * 1000.0).to_be_bytes());
     bytes
 }
 
@@ -428,3 +428,23 @@ pub fn portal() -> &'static Portal {
 /// other uploads at the same moment.
 pub static UPLOAD_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> =
     Lazy::new(|| tokio::sync::Mutex::new(()));
+
+/// A source that takes a good while to encode, so a test can act during the encode.
+pub fn sample_slow_to_encode() -> &'static [u8] {
+    static SAMPLE: Lazy<Vec<u8>> = Lazy::new(|| {
+        generate(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=600:size=320x240:rate=30",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+            ],
+            "mp4",
+        )
+    });
+    &SAMPLE
+}

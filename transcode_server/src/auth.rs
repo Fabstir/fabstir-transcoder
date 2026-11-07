@@ -88,7 +88,7 @@ pub async fn handle_rejection(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use warp::http::StatusCode;
@@ -108,7 +108,7 @@ mod tests {
         .unwrap()
     }
 
-    fn valid_token() -> &'static str {
+    pub(crate) fn valid_token() -> &'static str {
         static TOKEN: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
             let token = token(4_000_000_000);
             std::env::set_var("FABSTIR_TRANSCODER_JWT", &token);

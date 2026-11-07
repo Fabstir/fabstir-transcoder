@@ -586,6 +586,32 @@ fn trim_duration(format: &VideoFormat, total_duration: f64) -> Option<f64> {
     })
 }
 
+/// How long an output should be if its source's header is telling the truth.
+fn expected_output_length(format: &VideoFormat, source_claims: f64) -> f64 {
+    trim_duration(format, source_claims).unwrap_or(source_claims)
+}
+
+/// True if an output's real length is further from what its source claims than
+/// rounding and container differences explain: 1 s, or 1% of a long title.
+fn duration_mismatch(expected: f64, measured: f64) -> bool {
+    expected > 0.0 && (expected - measured).abs() > (expected * 0.01).max(1.0)
+}
+
+/// How long a finished output really is, taken from the output itself: FFmpeg wrote
+/// it, so what the source's header claims has no say. FFmpeg's clock would be simpler,
+/// but it stops at the start of the last frame (half a second short at 2 fps), and
+/// with the moderation tap running it follows the tap past the end of a trimmed output.
+async fn measure_output(file_name: &str, ext: &str, is_hls: bool) -> Result<f64, String> {
+    if is_hls {
+        let playlist = format!("{}/playlist.m3u8", hls_output_dir(file_name));
+        let parsed =
+            crate::hls_segment::parse_hls_playlist(&playlist).map_err(|e| e.to_string())?;
+        Ok(parsed.segments.iter().map(|(_, duration)| duration).sum())
+    } else {
+        get_video_duration(&plain_output_path(file_name, ext)).await
+    }
+}
+
 /// True for encoders with a `-cpu-used` option. Others refuse to start if given it.
 fn has_cpu_used_option(vcodec: &str) -> bool {
     vcodec == "libaom-av1" || vcodec.starts_with("libvpx")
@@ -868,7 +894,8 @@ pub struct LocalOutput {
     pub dest: Option<String>,
     pub encrypt_flag: bool,
     pub is_hls: bool,
-    pub total_duration: f64,
+    /// How long the output really is, measured from the file itself.
+    pub encoded_duration: f64,
     pub preview_percent: u32,
     pub video_format: serde_json::Value,
     /// Protects the output from GC while it's needed, and deletes it after.
@@ -965,6 +992,26 @@ pub async fn transcode_video_produce(
     )
     .await?;
 
+    let expected_duration = expected_output_length(&format, total_duration);
+    let encoded_duration = match measure_output(&file_name, &format.ext, is_hls).await {
+        Ok(measured) => {
+            if duration_mismatch(expected_duration, measured) {
+                eprintln!(
+                    "DURATION MISMATCH task_id={} format={} source_claims={:.3}s encoded={:.3}s",
+                    task_id, format.id, expected_duration, measured
+                );
+            }
+            measured
+        }
+        Err(e) => {
+            eprintln!(
+                "Could not measure format {}: {}. Using what the source claims.",
+                format.id, e
+            );
+            expected_duration
+        }
+    };
+
     Ok(LocalOutput {
         task_id,
         format_index,
@@ -973,7 +1020,7 @@ pub async fn transcode_video_produce(
         dest: format.dest,
         encrypt_flag,
         is_hls,
-        total_duration,
+        encoded_duration,
         preview_percent,
         video_format: video_format_value,
         local_file,
@@ -994,7 +1041,7 @@ pub async fn transcode_video_publish(
         dest,
         encrypt_flag,
         is_hls,
-        total_duration,
+        encoded_duration,
         preview_percent,
         video_format: _,
         local_file: _local_file,
@@ -1022,7 +1069,7 @@ pub async fn transcode_video_publish(
             status_code: 200,
             message: "HLS transcoding successful".into(),
             cid: hls_json,
-            duration: total_duration,
+            duration: encoded_duration,
         }));
     }
 
@@ -1042,7 +1089,7 @@ pub async fn transcode_video_publish(
                     status_code: 200,
                     message: String::from("Transcoding successful"),
                     cid: encrypted.into_cid(),
-                    duration: total_duration,
+                    duration: encoded_duration,
                 }
             }
             Err(e) => failed_upload_response(e),
@@ -1056,7 +1103,7 @@ pub async fn transcode_video_publish(
                     status_code: 200,
                     message: String::from("Transcoding successful"),
                     cid,
-                    duration: total_duration,
+                    duration: encoded_duration,
                 }
             }
             Err(e) => failed_upload_response(e),
@@ -1510,6 +1557,53 @@ mod tests {
         }
     }
 
+    /// A trimmed output is meant to be shorter, and mustn't read as a mismatch.
+    #[test]
+    fn test_the_expected_length_allows_for_a_trim() {
+        let trimmed = format_from(r#"{"id":1,"ext":"mp4","trim_percent":20}"#);
+        assert_eq!(expected_output_length(&trimmed, 120.0), 24.0);
+        assert!(!duration_mismatch(
+            expected_output_length(&trimmed, 120.0),
+            24.0
+        ));
+
+        let full = format_from(r#"{"id":1,"ext":"mp4"}"#);
+        assert_eq!(expected_output_length(&full, 120.0), 120.0);
+
+        let hls = format_from(r#"{"id":1,"ext":"mp4","hls":true,"trim_percent":20}"#);
+        assert_eq!(
+            expected_output_length(&hls, 120.0),
+            120.0,
+            "HLS ignores the trim"
+        );
+    }
+
+    /// Small differences are normal, and a false alarm on every job would get ignored.
+    #[test]
+    fn test_only_a_real_difference_in_length_counts_as_a_mismatch() {
+        for (expected, measured, mismatch) in [
+            (120.0, 120.001, false),
+            (120.0, 120.9, false),
+            (120.0, 121.5, true),
+            (120.0, 4.0, true),
+            (4.0, 120.0, true),
+            (36000.0, 120.0, true),
+            // A long title: 1% of it, not 1 s.
+            (7200.0, 7250.0, false),
+            (7200.0, 7300.0, true),
+            // Nothing was claimed, so there's nothing to disagree with.
+            (0.0, 120.0, false),
+        ] {
+            assert_eq!(
+                duration_mismatch(expected, measured),
+                mismatch,
+                "expected {} measured {}",
+                expected,
+                measured
+            );
+        }
+    }
+
     // ── Local files of a job ────────────────────────────────────────────────
 
     fn local_output(file_name: &str, ext: &str, encrypt_flag: bool) -> LocalOutput {
@@ -1522,7 +1616,7 @@ mod tests {
             dest: None,
             encrypt_flag,
             is_hls: false,
-            total_duration: 1.0,
+            encoded_duration: 1.0,
             preview_percent: 0,
             video_format: serde_json::json!({}),
             local_file,
