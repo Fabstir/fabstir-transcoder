@@ -250,7 +250,7 @@ Authorization: Bearer <JWT_TOKEN>
 | `status_code` | int | `200` while the job is queued, running or finished. Any other value means the job has failed permanently or isn't known here (see [Failed Jobs](#failed-jobs)). The HTTP response itself is still 200. |
 | `metadata` | string | JSON array (as string) of transcoded format objects, each with an added `cid` field. Value is `"Transcoding in progress"` while the job is running. |
 | `progress` | int | Overall progress percentage, averaged across all output formats. A running job stays at 99 or below, including while it is being moderated and uploaded. 100 means the job has finished and its result is in `metadata`. |
-| `duration` | float | Source media duration in seconds, as reported by ffprobe. `0.0` if the job has not yet completed or if ffprobe could not determine duration. |
+| `duration` | float | Source media duration in seconds, as reported by ffprobe. Available as soon as the source has been downloaded, and from then on in every response, including for a job that later fails. `0.0` means not known: the job is still queued or downloading, or ffprobe could not determine the duration. |
 
 **Metadata Format (parsed)**
 
@@ -286,13 +286,13 @@ The `cid` field on each format object is the content identifier of the transcode
 POST /transcode               -> task_id
      |
      v
-GET /get_transcoded/{task_id}  -> progress: 0,   duration: 0.0
-GET /get_transcoded/{task_id}  -> progress: 45,  duration: 0.0
+GET /get_transcoded/{task_id}  -> progress: 0,   duration: 0.0     (queued or downloading)
+GET /get_transcoded/{task_id}  -> progress: 45,  duration: 125.5
 GET /get_transcoded/{task_id}  -> progress: 100, duration: 125.5, metadata: "[...]"
 ```
 
 - Poll until `status_code != 200` (failed) or `progress == 100` (finished). Check `status_code` first, because `progress` is not meaningful on a failed job.
-- `duration` is `0.0` until the job completes
+- `duration` is `0.0` until the source has been downloaded and probed, and doesn't change after that
 - `metadata` is `"Transcoding in progress"` (a plain string, not JSON) until the job completes
 
 #### Failed Jobs
@@ -393,19 +393,21 @@ Client                          Transcoder
   |                                 |  1. Download source from S5/IPFS
   |                                 |  2. Decrypt if is_encrypted=true
   |                                 |  3. Extract duration via ffprobe
+  |                                 |     (reported from here on)
   |                                 |  4. For each media format:
   |                                 |     a. FFmpeg transcode (GPU or CPU)
   |                                 |     b. Update progress (up to 99%)
   |                                 |     c. Encrypt output if needed
   |                                 |     d. Upload to S5/IPFS
   |                                 |     e. Record output CID
-  |                                 |  5. Store metadata + duration
+  |                                 |  5. Store metadata
   |                                 |  6. Set progress to 100%
   |                                 |  7. Release semaphore permit
   |                                 |
   |  GET /get_transcoded/abc-123    |
   |-------------------------------->|
-  |  { progress: 45, duration: 0 }  |
+  |  { progress: 45,                |
+  |    duration: 125.5 }            |
   |<--------------------------------|
   |                                 |
   |  GET /get_transcoded/abc-123    |

@@ -78,17 +78,25 @@ static PATH_TO_TRANSCODED_FILE: Lazy<String> = Lazy::new(|| {
         .unwrap_or_else(|_| panic!("PATH_TO_TRANSCODED_FILE not set in .env"))
 });
 
-/// Every job this process has accepted, with the time it ended once it has.
-/// A task missing from here was never accepted, or was lost in a restart.
-static JOB_RECORDS: Lazy<std::sync::Mutex<HashMap<String, Option<Instant>>>> =
+/// What this process knows about a job it has accepted.
+#[derive(Default)]
+struct JobRecord {
+    ended_at: Option<Instant>,
+    /// Seconds, or 0.0 until the source has been probed.
+    source_duration: f64,
+}
+
+/// Every job this process has accepted. A task missing from here was never
+/// accepted, or was lost in a restart.
+static JOB_RECORDS: Lazy<std::sync::Mutex<HashMap<String, JobRecord>>> =
     Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
 
-fn job_records() -> std::sync::MutexGuard<'static, HashMap<String, Option<Instant>>> {
+fn job_records() -> std::sync::MutexGuard<'static, HashMap<String, JobRecord>> {
     JOB_RECORDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn register_job(task_id: &str) {
-    job_records().insert(task_id.to_string(), None);
+    job_records().insert(task_id.to_string(), JobRecord::default());
 }
 
 fn forget_job(task_id: &str) {
@@ -96,15 +104,24 @@ fn forget_job(task_id: &str) {
 }
 
 fn mark_job_ended(task_id: &str) {
-    job_records().insert(task_id.to_string(), Some(Instant::now()));
+    job_records()
+        .entry(task_id.to_string())
+        .or_default()
+        .ended_at = Some(Instant::now());
+}
+
+fn set_source_duration(task_id: &str, duration: f64) {
+    if let Some(record) = job_records().get_mut(task_id) {
+        record.source_duration = duration;
+    }
 }
 
 /// Removes the jobs that ended more than `ttl` ago and returns their ids. Running
 /// and queued jobs always stay.
-fn take_expired(records: &mut HashMap<String, Option<Instant>>, ttl: Duration) -> Vec<String> {
+fn take_expired(records: &mut HashMap<String, JobRecord>, ttl: Duration) -> Vec<String> {
     let mut expired = Vec::new();
-    records.retain(|task_id, ended| {
-        let is_expired = ended.is_some_and(|at| at.elapsed() >= ttl);
+    records.retain(|task_id, record| {
+        let is_expired = record.ended_at.is_some_and(|at| at.elapsed() >= ttl);
         if is_expired {
             expired.push(task_id.clone());
         }
@@ -340,16 +357,21 @@ async fn record_failure(task_id: &str, failure: JobFailure) {
 /// non-200 means the job has failed permanently, with the reason in `metadata`.
 /// A moderation hold is NOT a failure: it stays 200 with `metadata` `[]`.
 async fn job_status(task_id: &str) -> (i32, String, f64) {
+    let record_duration = job_records().get(task_id).map(|r| r.source_duration);
     if let Some(failure) = FAILED.lock().await.get(task_id) {
-        return (failure.status_code, failure.reason.to_string(), 0.0);
+        return (
+            failure.status_code,
+            failure.reason.to_string(),
+            record_duration.unwrap_or(0.0),
+        );
     }
     if let Some(entry) = TRANSCODED.lock().await.get(task_id).cloned() {
         return (200, entry.0, entry.1);
     }
-    if job_records().contains_key(task_id) {
-        return (200, "Transcoding in progress".to_string(), 0.0);
+    match record_duration {
+        Some(duration) => (200, "Transcoding in progress".to_string(), duration),
+        None => (404, "Unknown task".to_string(), 0.0),
     }
-    (404, "Unknown task".to_string(), 0.0)
 }
 
 /// Run a job so that every way it can end is reported. Its own task isolates a
@@ -580,7 +602,13 @@ async fn process_single_job(
     // Then, we transcode the downloaded video with each video format
     let mut transcoded_formats = Vec::new();
     let mut failed_formats = 0usize;
-    let mut source_duration: f64 = 0.0;
+
+    // As soon as the source is here, and reported from now on: the node works out its
+    // billing steps from this, and can prove nothing while it reads 0.0.
+    let mut source_duration = transcode_video::get_video_duration(&file_path)
+        .await
+        .unwrap_or(0.0);
+    set_source_duration(&task_id, source_duration);
 
     // ── M3 shadow moderation (D1/D4): fire-and-forget, concurrent with the
     //    transcode loop below; incapable of delaying, failing, or blocking
@@ -820,7 +848,11 @@ async fn process_single_job(
             if gate.holds() {
                 // ── HOLD: upload nothing; discard local temp; record held status ──
                 eprintln!("MODERATION HOLD task_id={} outcome={:?}", task_id, outcome);
-                let held_duration = pending.first().map(|o| o.total_duration).unwrap_or(0.0);
+                let held_duration = if source_duration > 0.0 {
+                    source_duration
+                } else {
+                    pending.first().map(|o| o.total_duration).unwrap_or(0.0)
+                };
                 for out in &pending {
                     if out.is_hls {
                         let _ = fs::remove_dir_all(held_output_path(out));
@@ -2813,6 +2845,7 @@ mod tests {
         status_code: i32,
         metadata: String,
         progress: i32,
+        duration: f64,
     }
 
     async fn run_job_with(
@@ -2839,12 +2872,13 @@ mod tests {
             ),
         )
         .await;
-        let (status_code, metadata, _) = job_status(&id).await;
+        let (status_code, metadata, duration) = job_status(&id).await;
         JobEnd {
             progress: shared::calculate_overall_progress(&id),
             id,
             status_code,
             metadata,
+            duration,
         }
     }
 
@@ -3138,6 +3172,214 @@ mod tests {
                 "reported 100 with no result yet"
             );
         }
+    }
+
+    // ── The source duration: the node works out its billing steps from it ───
+
+    /// Length of `sample_video`, near enough for any container's rounding.
+    fn is_about_three_seconds(duration: f64) -> bool {
+        (2.5..=3.5).contains(&duration)
+    }
+
+    #[tokio::test]
+    async fn test_a_running_job_reports_its_duration_once_it_is_known() {
+        let id = fresh_task_id();
+        register_job(&id);
+        assert_eq!(
+            job_status(&id).await.2,
+            0.0,
+            "unknown until the source is probed"
+        );
+
+        set_source_duration(&id, 125.5);
+
+        assert_eq!(
+            job_status(&id).await,
+            (200, "Transcoding in progress".to_string(), 125.5)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_job_keeps_reporting_a_duration_it_found() {
+        let id = fresh_task_id();
+        register_job(&id);
+        set_source_duration(&id, 125.5);
+        record_failure(&id, JobFailure::server("All formats failed")).await;
+        assert_eq!(
+            job_status(&id).await,
+            (500, "All formats failed".to_string(), 125.5)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_duration_survives_the_job_ending() {
+        let id = fresh_task_id();
+        register_job(&id);
+        set_source_duration(&id, 125.5);
+        mark_job_ended(&id);
+        assert_eq!(job_status(&id).await.2, 125.5);
+    }
+
+    /// Reporting a duration must not make an unknown task look like a real one.
+    #[tokio::test]
+    async fn test_a_duration_for_a_task_nobody_registered_changes_nothing() {
+        let id = fresh_task_id();
+        set_source_duration(&id, 125.5);
+        assert_eq!(
+            job_status(&id).await,
+            (404, "Unknown task".to_string(), 0.0)
+        );
+    }
+
+    /// Both ways a client can ask.
+    #[tokio::test]
+    async fn test_both_apis_report_the_duration_of_a_running_job() {
+        let id = fresh_task_id();
+        register_job(&id);
+        set_source_duration(&id, 125.5);
+
+        let rest = RestHandler {
+            transcode_task_sender: mpsc::channel(1).0,
+        };
+        let reply = rest.get_transcoded(id.clone()).await.unwrap();
+        let bytes = hyper::body::to_bytes(warp::Reply::into_response(reply).into_body())
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["duration"], 125.5);
+        assert_eq!(v["metadata"], "Transcoding in progress");
+
+        let grpc = TranscodeServiceHandler {
+            transcode_task_sender: mpsc::channel(1).0,
+        };
+        let response = grpc
+            .get_transcoded(Request::new(GetTranscodedRequest { task_id: id }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.duration, 125.5);
+    }
+
+    /// Polls a real job as a client would, and returns what it saw.
+    async fn watch_job(source: String, gate: GateMode) -> Vec<(i32, String, f64)> {
+        let id = fresh_task_id();
+        register_job(&id);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let watched = id.clone();
+        let watcher = tokio::spawn(async move {
+            loop {
+                let progress = shared::calculate_overall_progress(&watched);
+                let (_, metadata, duration) = job_status(&watched).await;
+                log.lock().unwrap().push((progress, metadata, duration));
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+        supervise(
+            id.clone(),
+            LONG_DEADLINE,
+            process_single_job(
+                id.clone(),
+                source,
+                SMALL.to_string(),
+                false,
+                false,
+                0,
+                gate,
+                Box::new(StubModerationClient {
+                    outcome: ModerationOutcome::Cleared,
+                }),
+            ),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        watcher.abort();
+        let seen = seen.lock().unwrap().clone();
+        seen
+    }
+
+    /// What the node dev asked for: the real value from early in the run, the same
+    /// value at the end, and never a real value that later goes back to 0.0.
+    #[tokio::test]
+    async fn test_a_real_job_reports_its_duration_from_early_on_until_the_end() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let _uploads = UPLOAD_TEST_LOCK.lock().await;
+        for gate in [GateMode::Off, GateMode::Enforce] {
+            let (source, _) = serve_source(sample_video());
+            let seen = watch_job(source, gate).await;
+
+            let early = seen
+                .iter()
+                .find(|(_, metadata, duration)| {
+                    metadata == "Transcoding in progress" && *duration > 0.0
+                })
+                .unwrap_or_else(|| panic!("{:?}: never reported while running", gate));
+            assert!(is_about_three_seconds(early.2), "{}", early.2);
+            assert!(
+                early.0 < 50,
+                "{:?}: only reported late, at {}%",
+                gate,
+                early.0
+            );
+
+            let (_, last_metadata, last_duration) = seen.last().unwrap();
+            assert!(last_metadata.starts_with("[{"), "{}", last_metadata);
+            assert_eq!(*last_duration, early.2, "the value must not change");
+
+            let first_real = seen.iter().position(|(_, _, d)| *d > 0.0).unwrap();
+            assert!(
+                seen[first_real..].iter().all(|(_, _, d)| *d == early.2),
+                "{:?}: the duration moved after it first appeared",
+                gate
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_job_whose_formats_all_fail_still_reports_the_duration() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let (source, _) = serve_source(sample_video());
+        let end = run_job(
+            &source,
+            r#"[{"id":1,"ext":"mp4","vcodec":"no_such_encoder"}]"#,
+        )
+        .await;
+        assert_eq!(end.status_code, 500);
+        assert!(is_about_three_seconds(end.duration), "{}", end.duration);
+    }
+
+    #[tokio::test]
+    async fn test_a_held_job_reports_the_duration() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let _uploads = UPLOAD_TEST_LOCK.lock().await;
+        let (source, _) = serve_source(sample_video());
+        let (client, _) = recording(ModerationOutcome::Blocked);
+        let end = run_job_with(&source, SMALL, false, GateMode::Enforce, client).await;
+        assert_eq!((end.status_code, end.metadata.as_str()), (200, "[]"));
+        assert!(is_about_three_seconds(end.duration), "{}", end.duration);
+    }
+
+    /// Before the source arrives there's nothing to measure, and a file ffprobe can't
+    /// read has no duration at all. Both stay at 0.0, which the node reads as unknown.
+    #[tokio::test]
+    async fn test_the_duration_stays_zero_when_it_cannot_be_known() {
+        let end = run_job(&format!("s5://{}", fresh_cid()), SMALL).await;
+        assert_eq!(end.status_code, 500);
+        assert_eq!(end.duration, 0.0, "the download failed");
+
+        if !have_ffmpeg() {
+            return;
+        }
+        let (source, _) = serve_source(b"this is not a video");
+        let end = run_job(&source, SMALL).await;
+        assert_eq!(end.status_code, 500);
+        assert_eq!(end.duration, 0.0, "nothing to probe");
     }
 
     // ── Encrypted sources ───────────────────────────────────────────────────
@@ -3695,7 +3937,7 @@ mod tests {
         eventually("the last job to end", move || {
             job_records()
                 .get(&settled)
-                .map_or(false, |ended| ended.is_some())
+                .map_or(false, |record| record.ended_at.is_some())
         })
         .await;
 
@@ -3789,7 +4031,9 @@ mod tests {
         enqueue(&sender, queue_job(&id, "panic")).unwrap();
         let ended = id.clone();
         eventually("the job to end", move || {
-            job_records().get(&ended).is_some_and(|at| at.is_some())
+            job_records()
+                .get(&ended)
+                .is_some_and(|r| r.ended_at.is_some())
         })
         .await;
         wait_until_no_job_is_active().await;
@@ -4023,10 +4267,14 @@ mod tests {
     #[test]
     fn test_only_jobs_that_ended_long_enough_ago_expire() {
         let long_ago = Instant::now() - std::time::Duration::from_secs(100);
+        let record = |ended_at| JobRecord {
+            ended_at,
+            source_duration: 0.0,
+        };
         let mut records = HashMap::from([
-            ("old".to_string(), Some(long_ago)),
-            ("recent".to_string(), Some(Instant::now())),
-            ("running".to_string(), None),
+            ("old".to_string(), record(Some(long_ago))),
+            ("recent".to_string(), record(Some(Instant::now()))),
+            ("running".to_string(), record(None)),
         ]);
         let expired = take_expired(&mut records, std::time::Duration::from_secs(50));
         assert_eq!(expired, ["old"]);
