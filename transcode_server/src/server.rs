@@ -1521,10 +1521,12 @@ fn storage_dir(path: &str) -> String {
     }
 }
 
-/// The file-name prefix of a storage path: empty for a directory, `prefix_` for
-/// `/dir/prefix_`. Files are named this, followed by what the job calls them.
+/// The file-name prefix of a storage path: empty for `/dir/`, `prefix_` for
+/// `/dir/prefix_`. Jobs name files by adding to the path, so without a trailing slash
+/// it is a prefix, even when a directory of that name also exists: host1 and host2 use
+/// `/app/cache/sources` and create that directory, and their files sit next to it.
 fn storage_prefix(path: &str) -> String {
-    if path.ends_with('/') || Path::new(path).is_dir() {
+    if path.ends_with('/') {
         return String::new();
     }
     Path::new(path)
@@ -1537,29 +1539,25 @@ fn storage_prefix(path: &str) -> String {
 /// spell them, because a GC pin only protects an exact match.
 fn storage_entries(path: &str) -> std::io::Result<Vec<(std::path::PathBuf, fs::Metadata)>> {
     let prefix = storage_prefix(path);
-    let as_prefix = !prefix.is_empty();
-    let dir = if as_prefix {
-        storage_dir(path)
-    } else {
-        path.to_string()
-    };
-
     let mut entries = Vec::new();
-    for entry in fs::read_dir(&dir)? {
+    for entry in fs::read_dir(storage_dir(path))? {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(rest) = name.strip_prefix(prefix.as_str()) else {
             continue;
         };
+        // The prefix itself, such as a directory created under that name, isn't a file
+        // any job made.
+        if rest.is_empty() {
+            continue;
+        }
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        let spelled = if as_prefix || path.ends_with('/') {
-            std::path::PathBuf::from(format!("{}{}", path, rest))
-        } else {
-            entry.path()
-        };
-        entries.push((spelled, metadata));
+        entries.push((
+            std::path::PathBuf::from(format!("{}{}", path, rest)),
+            metadata,
+        ));
     }
     Ok(entries)
 }
@@ -2288,7 +2286,7 @@ mod tests {
         std::fs::write(&pinned, [0u8; 64]).unwrap();
         std::fs::write(&victim, [0u8; 64]).unwrap();
         let guard = crate::moderation::pin(pinned.to_str().unwrap());
-        garbage_collect(dir.to_str().unwrap(), 0); // threshold 0: delete all it can
+        garbage_collect(&as_directory(&dir), 0); // threshold 0: delete all it can
         assert!(pinned.exists(), "pinned source must survive GC");
         assert!(!victim.exists(), "unpinned file must be collected");
         drop(guard);
@@ -2313,7 +2311,7 @@ mod tests {
             std::fs::write(d.join("seg0.ts"), [0u8; 64]).unwrap();
         }
         let guard = crate::moderation::pin(pinned.to_str().unwrap());
-        garbage_collect(dir.to_str().unwrap(), 0); // threshold 0: delete all it can
+        garbage_collect(&as_directory(&dir), 0); // threshold 0: delete all it can
         assert!(pinned.exists(), "pinned output dir must survive GC");
         assert!(!victim.exists(), "unpinned dir must be collected");
         drop(guard);
@@ -5082,6 +5080,12 @@ mod tests {
 
     // ── Garbage collection ──────────────────────────────────────────────────
 
+    /// A directory as a storage path has to be written: with its trailing slash, because
+    /// jobs name files by adding to the path.
+    fn as_directory(dir: &Path) -> String {
+        format!("{}/", dir.to_str().unwrap())
+    }
+
     fn gc_test_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("gc-{}-{}", name, Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -5101,7 +5105,7 @@ mod tests {
     fn test_garbage_collect_deletes_the_oldest_files_first() {
         let dir = gc_test_dir("oldest");
         write_in_age_order(&dir, &["oldest", "middle", "newest"]);
-        garbage_collect(dir.to_str().unwrap(), 150);
+        garbage_collect(&as_directory(&dir), 150);
         assert!(!dir.join("oldest").exists());
         assert!(!dir.join("middle").exists());
         assert!(dir.join("newest").exists());
@@ -5112,7 +5116,7 @@ mod tests {
     fn test_garbage_collect_leaves_everything_when_under_the_threshold() {
         let dir = gc_test_dir("under");
         write_in_age_order(&dir, &["a", "b"]);
-        garbage_collect(dir.to_str().unwrap(), 1000);
+        garbage_collect(&as_directory(&dir), 1000);
         assert!(dir.join("a").exists() && dir.join("b").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5133,6 +5137,56 @@ mod tests {
         garbage_collect(dir.join("src_").to_str().unwrap(), 0);
         assert!(!dir.join("src_a").exists() && !dir.join("src_b").exists());
         assert!(dir.join("other").exists(), "outside the prefix");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Host1 and host2 use `/app/cache/sources` with no slash, and their entrypoint also
+    /// creates a directory of that name. Files still go next to it, as `sources<name>`, so
+    /// that's where GC and the clean-up must look, and the directory itself must stay.
+    #[test]
+    fn test_a_directory_named_like_a_prefix_changes_nothing() {
+        let dir = gc_test_dir("prefix-and-directory");
+        std::fs::create_dir_all(dir.join("sources")).unwrap();
+        write_in_age_order(&dir, &["sourcesold", "sourcesnew"]);
+        let prefix = format!("{}/sources", dir.to_str().unwrap());
+
+        garbage_collect(&prefix, 150);
+        assert!(!dir.join("sourcesold").exists(), "GC must find the files");
+        assert!(dir.join("sourcesnew").exists());
+        assert!(
+            dir.join("sources").is_dir(),
+            "and leave the directory alone"
+        );
+
+        let decrypted = format!("sources{}", "ab".repeat(32));
+        std::fs::write(dir.join(&decrypted), b"x").unwrap();
+        std::fs::write(dir.join("sourcescid.task.part"), b"x").unwrap();
+        sweep_leftovers(&prefix);
+        assert!(!dir.join(&decrypted).exists());
+        assert!(!dir.join("sourcescid.task.part").exists());
+        assert!(dir.join("sources").is_dir());
+
+        garbage_collect(&prefix, 0);
+        assert!(
+            dir.join("sources").is_dir(),
+            "not even when everything else goes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_a_pin_protects_a_file_next_to_a_directory_named_like_the_prefix() {
+        let dir = gc_test_dir("prefix-and-directory-pin");
+        std::fs::create_dir_all(dir.join("sources")).unwrap();
+        let prefix = format!("{}/sources", dir.to_str().unwrap());
+        let source = format!("{}cid", prefix);
+        std::fs::write(&source, [0u8; 8]).unwrap();
+        let guard = crate::moderation::pin(&source);
+        garbage_collect(&prefix, 0);
+        assert!(Path::new(&source).exists());
+        drop(guard);
+        garbage_collect(&prefix, 0);
+        assert!(!Path::new(&source).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5164,7 +5218,7 @@ mod tests {
         // A file that only looks like one of the directories is not ours.
         std::fs::write(dir.join("file_hls"), b"x").unwrap();
 
-        sweep_leftovers(dir.to_str().unwrap());
+        sweep_leftovers(&as_directory(&dir));
 
         let mut left: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
