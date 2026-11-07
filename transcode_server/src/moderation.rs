@@ -474,9 +474,9 @@ pub fn frames_cap(duration_secs: f64) -> usize {
 
 // ── M3 GC pin registry ─────────────────────────────────────────────────────
 // CONTRACT §3: the source must never be mutated/deleted from before the call
-// until the response arrives (worst case hours, §6). GC is the only deletion
-// path for sources (verified invariant — structural test in server.rs), so
-// pinning GC covers the whole requirement.
+// until the response arrives (worst case hours, §6). Sources are only ever deleted
+// by GC or `DeleteWhenUnused`, and both respect pins (verified invariant — structural
+// test in server.rs), so a pin covers the whole requirement.
 
 /// Refcounted so two shadow windows on one cached source (same cid, two jobs)
 /// stay pinned until BOTH release.
@@ -519,6 +519,30 @@ pub fn is_pinned(path: &std::path::Path) -> bool {
     match path.to_str() {
         Some(s) => pinned_map().contains_key(s),
         None => false,
+    }
+}
+
+/// Deletes a decrypted source when dropped, unless something still has it pinned. Each
+/// user declares this before its pin, so that the pin has gone by the time this runs:
+/// whoever finishes last, whether a job or a shadow scan, removes the file.
+pub struct DeleteWhenUnused {
+    path: String,
+}
+
+pub fn delete_when_unused(path: &str) -> DeleteWhenUnused {
+    DeleteWhenUnused {
+        path: path.to_owned(),
+    }
+}
+
+impl Drop for DeleteWhenUnused {
+    fn drop(&mut self) {
+        // The lock stays held across the delete, so a pin can't land in between. A job
+        // that pins just after this finds no file, and downloads it again.
+        let pinned = pinned_map();
+        if !pinned.contains_key(&self.path) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1099,6 +1123,67 @@ pub fn sha256_file(path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Decrypted sources go as soon as nothing needs them ──────────────────
+
+    fn temp_source() -> String {
+        let path = std::env::temp_dir().join(format!("source-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"decrypted").unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    /// In the order a job declares them: the pin goes first, then the delete.
+    fn hold(path: &str) -> (DeleteWhenUnused, PinGuard) {
+        (delete_when_unused(path), pin(path))
+    }
+
+    #[test]
+    fn test_a_source_nobody_else_is_using_is_deleted_when_released() {
+        let path = temp_source();
+        let (delete, pinned) = hold(&path);
+        drop(pinned);
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "not until the delete runs"
+        );
+        drop(delete);
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    /// Two jobs on one source, or a job and a shadow scan: the last one out deletes it.
+    #[test]
+    fn test_a_source_still_pinned_by_someone_else_stays() {
+        let path = temp_source();
+        let (first_delete, first_pin) = hold(&path);
+        let (second_delete, second_pin) = hold(&path);
+
+        drop(first_pin);
+        drop(first_delete);
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "the second is still using it"
+        );
+
+        drop(second_pin);
+        drop(second_delete);
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    /// A pinned source stays even if the one still using it would never delete it.
+    #[test]
+    fn test_a_pin_without_a_delete_keeps_the_source() {
+        let path = temp_source();
+        let keeping = pin(&path);
+        drop(hold(&path));
+        assert!(std::path::Path::new(&path).exists());
+        drop(keeping);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_deleting_a_source_that_is_already_gone_is_fine() {
+        drop(hold("/nonexistent/source/never/created"));
+    }
 
     #[test]
     fn test_may_publish_only_cleared() {

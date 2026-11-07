@@ -46,7 +46,7 @@ Requires: FFmpeg, protobuf compiler (`protoc`). See [docs/API.md](docs/API.md) f
 
 ## API
 
-The server exposes both REST (port 8000) and gRPC (port 50051) interfaces.
+The server exposes a REST interface on port 8000. A gRPC interface on port 50051 is off unless `GRPC_ENABLED=true` is set.
 
 ### Proto Definition
 

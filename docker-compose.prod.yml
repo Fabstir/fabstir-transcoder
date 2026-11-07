@@ -6,7 +6,7 @@
 #
 # Image: ewr.vultrcr.com/fabstir/transcoder:{sha}
 # REST API: port 8000 (JWT-authenticated)
-# gRPC API: port 50051
+# gRPC API: port 50051, off unless GRPC_ENABLED=true. It has no token check.
 # Health: GET http://localhost:8000/health (unauthenticated, returns {"status":"ok"})
 #
 # REST Endpoints:
@@ -22,9 +22,27 @@ services:
   transcoder:
     image: ewr.vultrcr.com/fabstir/transcoder:${TRANSCODER_IMAGE_SHA:?Set TRANSCODER_IMAGE_SHA}
     restart: unless-stopped
-    ports:
-      - "8000:8000"     # REST API
-      # - "50051:50051" # Uncomment if gRPC access is needed
+
+    # Reached over the Docker network, and not published on the host: REST has no TLS,
+    # and its traffic carries CIDs that contain decryption keys.
+    expose:
+      - "8000"
+
+    # Locked down, so that a malicious video exploiting FFmpeg gets as little as
+    # possible. Existing volumes must be writable by this UID, once:
+    #   docker run --rm -v transcoder-downloads:/d -v transcoder-output:/o busybox chown -R 1000:1000 /d /o
+    # If they aren't, the server exits at startup and names the path.
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
+
     environment:
       # -- S5 / Storage --
       PORTAL_URL: ${PORTAL_URL:?Required}              # S5 gateway URL
@@ -49,7 +67,8 @@ services:
       # -- Stuck jobs (optional; these are the defaults, and 0 turns either limit off) --
       # FFMPEG_STALL_TIMEOUT_SECS: 900   # Kill FFmpeg once its media clock has not moved for this long
       # JOB_DEADLINE_SECS: 86400         # Stop a job this long after it got a slot. Keep it above your longest real job
-      # JOB_RECORD_TTL_SECS: 86400       # How long a finished job's result stays available
+      # JOB_RECORD_TTL_SECS: 86400       # How long a finished job's result stays available. Results can contain keys, so keep it short
+      # GRPC_ENABLED: "true"             # Turns on gRPC on 50051, which has no token check
 
       # -- Authentication --
       FABSTIR_TRANSCODER_JWT: ${FABSTIR_TRANSCODER_JWT:?Required}            # JWT token for API authentication
@@ -92,7 +111,9 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,video}
 
     volumes:
-      # Temp storage for source downloads and transcoded files
+      # Temp storage for source downloads and transcoded files. These hold decrypted
+      # content during a job, so put them on a disk encrypted with a random key at each
+      # boot if you can (see "Protecting Content on the Host" in docs/API.md).
       - transcoder-downloads:/data/downloads
       - transcoder-output:/data/transcoded
 

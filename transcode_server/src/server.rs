@@ -150,6 +150,15 @@ async fn prune_job_records(ttl: Duration) {
     forget_job_results(&expired).await;
 }
 
+/// gRPC has no token check, and nothing we know of uses it, so it only runs on request.
+fn grpc_enabled_from(setting: Option<&str>) -> bool {
+    setting.is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+}
+
+fn grpc_enabled() -> bool {
+    grpc_enabled_from(var("GRPC_ENABLED").ok().as_deref())
+}
+
 /// A number from the environment, or `default` if it is unset or unreadable.
 fn env_u64(name: &str, default: u64) -> u64 {
     match var(name) {
@@ -687,6 +696,10 @@ async fn process_single_job(
 
     let file_path = source_file_path(&source_cid, is_encrypted);
 
+    // A decrypted copy is only kept for as long as something is using it. Declared
+    // before the pin, so that it runs once the pin has gone, however the job ends.
+    let _decrypted_copy = is_encrypted.then(|| moderation::delete_when_unused(&file_path));
+
     // For the whole job, and before looking for the file: GC could otherwise take a
     // cached source between this job finding it and starting to use it, or between
     // one format and the next.
@@ -718,7 +731,7 @@ async fn process_single_job(
     //    transcode loop below; incapable of delaying, failing, or blocking
     //    this job. The source (fresh or cache-hit) is final on disk here. ──
     if moderation::moderation_enabled() {
-        spawn_shadow_moderation(task_id.clone(), file_path.clone());
+        spawn_shadow_moderation(task_id.clone(), file_path.clone(), is_encrypted);
     }
 
     // ── WP-T publish gate (three-state MODERATION_GATE; default off) ──
@@ -1035,7 +1048,7 @@ async fn process_single_job(
 /// process; per-call deadline), log the outcome, relay a verdict via the
 /// (stubbed, OQ-M3-1) relay. Detached — the job never awaits it (D4:
 /// incapable of delaying, failing, or blocking a transcode).
-fn spawn_shadow_moderation(task_id: String, file_path: String) {
+fn spawn_shadow_moderation(task_id: String, file_path: String, is_encrypted: bool) {
     // Admission control first (D1 indirect-coupling guard): each pending
     // shadow call pins a multi-GB source, so at the cap we shed — fail open —
     // rather than let a wedged sidecar grow the pin set until the cache
@@ -1055,8 +1068,13 @@ fn spawn_shadow_moderation(task_id: String, file_path: String) {
     // the task's first poll the source would otherwise be unprotected. RAII: released on
     // every exit path, panic included (CONTRACT §3: the source must survive
     // until the response arrives).
+    //
+    // The scan can outlast its job, so if it's the last to finish, the decrypted copy
+    // is its to delete. Declared first, so that this runs after the pin has gone.
+    let decrypted_copy = is_encrypted.then(|| moderation::delete_when_unused(&file_path));
     let pin = moderation::pin(&file_path);
     tokio::spawn(async move {
+        let _decrypted_copy = decrypted_copy;
         let _pending = pending;
         let _pin = pin;
         let socket = match moderation::socket_path() {
@@ -1628,14 +1646,20 @@ fn prepare_storage(path: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// True for the name `source_file_path` gives a decrypted source: a SHA-256 in hex.
+fn is_decrypted_source_name(name: &str) -> bool {
+    name.len() == 64 && name.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+}
+
 /// Temporary files of jobs that were running when a process died. Their names
 /// end in a task id nothing will ask for again, so only disk space (and, for
-/// `.part` and `_ue` files, decrypted content) is left of them.
+/// `.part` and `_ue` files, decrypted content) is left of them. A decrypted source
+/// goes too, because the job that would have deleted it died with the process.
 fn is_leftover(name: &str, is_dir: bool) -> bool {
     if is_dir {
         name.ends_with("_hls") || name.ends_with("_modtap")
     } else {
-        name.ends_with(".part") || name.contains("_ue.")
+        name.ends_with(".part") || name.contains("_ue.") || is_decrypted_source_name(name)
     }
 }
 
@@ -1757,6 +1781,23 @@ fn rest_routes(
         .recover(auth::handle_rejection)
 }
 
+/// Resolves on SIGTERM, which is how `docker stop` asks a container to end. The server
+/// runs as PID 1, which ignores any signal it doesn't handle, so without this Docker
+/// waits out its 10 s and then kills it. Running FFmpegs end with the container.
+async fn terminate_requested() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    match signal(SignalKind::terminate()) {
+        Ok(mut terminate) => {
+            terminate.recv().await;
+        }
+        Err(e) => {
+            eprintln!("Cannot listen for SIGTERM: {}", e);
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 /// The main entry point for the transcode server. Initializes the server
 /// with the specified configuration, starts the gRPC server, and listens
 /// for incoming requests. Once a request is received, it spawns a new thread
@@ -1803,15 +1844,22 @@ async fn main() {
         },
     ));
 
-    let grpc_addr = "0.0.0.0:50051"
-        .parse()
-        .expect("Invalid gRPC server address");
-    let transcode_service_handler = TranscodeServiceHandler {
-        transcode_task_sender: task_sender.clone(),
+    let grpc_server = if grpc_enabled() {
+        let grpc_addr = "0.0.0.0:50051"
+            .parse()
+            .expect("Invalid gRPC server address");
+        let transcode_service_handler = TranscodeServiceHandler {
+            transcode_task_sender: task_sender.clone(),
+        };
+        tokio::spawn(
+            Server::builder()
+                .add_service(TranscodeServiceServer::new(transcode_service_handler))
+                .serve(grpc_addr),
+        )
+    } else {
+        println!("gRPC is off. Set GRPC_ENABLED=true to turn it on.");
+        tokio::spawn(std::future::pending())
     };
-    let grpc_server = Server::builder()
-        .add_service(TranscodeServiceServer::new(transcode_service_handler))
-        .serve(grpc_addr);
 
     let rest_handler = Arc::new(RestHandler {
         transcode_task_sender: task_sender,
@@ -1835,11 +1883,14 @@ async fn main() {
     // Neither listener should ever end. If one does, this process is no use, and
     // only exiting lets the container's restart policy bring it back: staying up
     // with one port dead looks healthy from outside.
-    let grpc_server = tokio::spawn(grpc_server);
     let rest_server = tokio::spawn(rest_server);
     tokio::select! {
         result = grpc_server => eprintln!("FATAL: gRPC server ended: {:?}", result),
         result = rest_server => eprintln!("FATAL: REST server ended: {:?}", result),
+        _ = terminate_requested() => {
+            println!("Stopping: asked to by SIGTERM");
+            std::process::exit(0);
+        }
     }
     std::process::exit(1);
 }
@@ -4010,14 +4061,138 @@ mod tests {
         let end = run_encrypted_job(&source).await;
         assert_eq!(end.status_code, 200, "{}", end.metadata);
         assert_eq!(parts.len(), 3);
+        // The source must have decrypted properly for there to be a real video in this.
+        let cid = published_cids(&end.metadata).remove(0);
+        let parsed = parse_encrypted_cid(cid.trim_start_matches("s5://")).unwrap();
+        let dir = gc_test_dir("source-output");
+        let (input, output) = (dir.join("enc"), dir.join("plain"));
+        let ciphertext = portal().uploads().last().unwrap().data.clone();
+        std::fs::write(&input, &ciphertext).unwrap();
+        encrypt_file::decrypt_file_xchacha20(
+            input.to_str().unwrap().to_string(),
+            output.to_str().unwrap().to_string(),
+            parsed.key,
+            0,
+            (ciphertext.len() / (262144 + 16)) as u32,
+        )
+        .unwrap();
+        assert_eq!(height_of(&std::fs::read(&output).unwrap()), 32);
+        let _ = std::fs::remove_dir_all(&dir);
+
         let cached = source_file_path(source.trim_start_matches("s5://"), true);
-        assert_eq!(std::fs::read(&cached).unwrap(), sample_video());
         let stem = cached.rsplit('/').next().unwrap();
-        let temporaries: Vec<String> = sources_containing(stem)
-            .into_iter()
-            .filter(|name| name != stem)
-            .collect();
-        assert!(temporaries.is_empty(), "left behind: {:?}", temporaries);
+        assert!(
+            !Path::new(&cached).exists(),
+            "the decrypted copy must not stay"
+        );
+        assert!(
+            sources_containing(stem).is_empty(),
+            "nor anything else of it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_encrypted_job_leaves_no_decrypted_copy() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let (source, _, _) = serve_encrypted_source(sample_video(), 1);
+        let end = run_job_with(
+            &source,
+            r#"[{"id":1,"ext":"mp4","vcodec":"no_such_encoder"}]"#,
+            true,
+            GateMode::Off,
+            Box::new(StubModerationClient {
+                outcome: ModerationOutcome::Cleared,
+            }),
+        )
+        .await;
+        assert_eq!(end.status_code, 500);
+        let cached = source_file_path(source.trim_start_matches("s5://"), true);
+        assert!(!Path::new(&cached).exists());
+    }
+
+    /// A job finishing must not pull the source out from under one still using it.
+    #[tokio::test]
+    async fn test_encrypted_jobs_on_one_source_both_finish_and_then_it_goes() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let _uploads = UPLOAD_TEST_LOCK.lock().await;
+        let (source, _, _) = serve_encrypted_source(sample_video(), 1);
+        let (quick, slower) = tokio::join!(
+            run_encrypted_job(&source),
+            run_job_with(
+                &source,
+                r#"[{"id":1,"ext":"mp4","vcodec":"libx264","vf":"scale=320:240"}]"#,
+                true,
+                GateMode::Off,
+                Box::new(StubModerationClient {
+                    outcome: ModerationOutcome::Cleared,
+                }),
+            ),
+        );
+        assert_eq!(quick.status_code, 200, "{}", quick.metadata);
+        assert_eq!(slower.status_code, 200, "{}", slower.metadata);
+        let cached = source_file_path(source.trim_start_matches("s5://"), true);
+        assert!(!Path::new(&cached).exists());
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_an_encrypted_job_removes_its_decrypted_copy() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let (source, _, _) = serve_encrypted_source(sample_slow_to_encode(), 1);
+        let id = fresh_task_id();
+        register_job(&id);
+        let slow = r#"[{"id":1,"ext":"mp4","vcodec":"libx264","vf":"scale=1280:720"}]"#;
+        let job = tokio::spawn(supervise(
+            id.clone(),
+            LONG_DEADLINE,
+            process_single_job(
+                id.clone(),
+                source.clone(),
+                slow.to_string(),
+                true,
+                false,
+                0,
+                GateMode::Off,
+                Box::new(StubModerationClient {
+                    outcome: ModerationOutcome::Cleared,
+                }),
+            ),
+        ));
+        let writing = id.clone();
+        eventually("FFmpeg to start writing", move || {
+            !outputs_containing(&writing).is_empty()
+        })
+        .await;
+        let cached = source_file_path(source.trim_start_matches("s5://"), true);
+        assert!(Path::new(&cached).exists(), "it's in use until now");
+
+        cancel_job(&id).await;
+        job.await.unwrap();
+
+        assert!(!Path::new(&cached).exists());
+    }
+
+    /// A shadow scan can outlast its job by hours, and the source has to stay until the
+    /// sidecar answers (CONTRACT §3). So the scan has to clean up after itself.
+    #[test]
+    fn test_a_shadow_scan_deletes_a_decrypted_source_when_it_finishes() {
+        let src = job_flow_src();
+        let start = src.find("fn spawn_shadow_moderation").expect("shadow fn");
+        let body = &src[start..];
+        let body = &body[..body.find("\nasync fn ").unwrap_or(body.len())];
+        let delete = body
+            .find("delete_when_unused")
+            .expect("cleans up after itself");
+        let pin = body.find("moderation::pin(").expect("pins");
+        assert!(
+            delete < pin,
+            "declared first, so that it runs after the pin is released"
+        );
     }
 
     /// The job used to carry on with whatever arrived. The chunks that made it
@@ -4949,14 +5124,22 @@ mod tests {
     #[test]
     fn test_boot_sweep_removes_only_what_a_dead_process_left_behind() {
         let dir = gc_test_dir("sweep");
-        for leftover in ["cid.task.part", "cid_33_task_ue.mp4"] {
+        let decrypted_source = "ab".repeat(32);
+        for leftover in [
+            "cid.task.part",
+            "cid_33_task_ue.mp4",
+            decrypted_source.as_str(),
+        ] {
             std::fs::write(dir.join(leftover), b"x").unwrap();
         }
         for leftover in ["cid_33_task_hls", "task_modtap"] {
             std::fs::create_dir_all(dir.join(leftover)).unwrap();
             std::fs::write(dir.join(leftover).join("f"), b"x").unwrap();
         }
-        for kept in ["uCachedSource", "abc_def"] {
+        // Plain sources are a cache worth keeping, and only the exact shape of a hashed
+        // name counts as a decrypted one.
+        let not_quite_a_hash = "ab".repeat(31);
+        for kept in ["uCachedSource", "abc_def", not_quite_a_hash.as_str()] {
             std::fs::write(dir.join(kept), b"x").unwrap();
         }
         // A file that only looks like one of the directories is not ours.
@@ -4969,7 +5152,14 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         left.sort();
-        assert_eq!(left, ["abc_def", "file_hls", "uCachedSource"]);
+        let mut expected = [
+            "abc_def",
+            "file_hls",
+            "uCachedSource",
+            not_quite_a_hash.as_str(),
+        ];
+        expected.sort();
+        assert_eq!(left, expected);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5018,6 +5208,47 @@ mod tests {
             .find("std::process::exit(1)")
             .expect("exits non-zero when one ends");
         assert!(exit > 0);
+    }
+
+    /// Nothing the node or SDK uses, and it has no token check, so it stays off unless
+    /// someone asks for it.
+    #[test]
+    fn test_grpc_is_off_unless_asked_for() {
+        assert!(!grpc_enabled_from(None));
+        assert!(!grpc_enabled_from(Some("")));
+        assert!(!grpc_enabled_from(Some("false")));
+        assert!(
+            !grpc_enabled_from(Some("yes please")),
+            "only an exact yes opens the port"
+        );
+        assert!(grpc_enabled_from(Some("true")));
+        assert!(grpc_enabled_from(Some("TRUE")));
+    }
+
+    /// `main` can't run in a test: the real binary is checked by connecting to the port.
+    #[test]
+    fn test_grpc_only_starts_when_enabled() {
+        let main_body = job_flow_src()
+            .split("async fn main() {")
+            .nth(1)
+            .expect("main");
+        let guard = main_body.find("grpc_enabled()").expect("a guard");
+        let start = main_body
+            .find("Server::builder()")
+            .expect("the gRPC server");
+        assert!(guard < start, "the server must sit behind the guard");
+    }
+
+    /// As PID 1 the server ignores a signal it doesn't handle, so `docker stop` waits out
+    /// its 10 s and then kills it. That's the 10 s restart measured on host2.
+    #[test]
+    fn test_main_stops_when_asked_to() {
+        let main_body = job_flow_src()
+            .split("async fn main() {")
+            .nth(1)
+            .expect("main");
+        let select = main_body.find("tokio::select!").expect("select");
+        assert!(main_body[select..].contains("terminate_requested()"));
     }
 
     /// `supervise` turns a panic into a failed job only by catching the unwind.

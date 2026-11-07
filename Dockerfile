@@ -118,8 +118,7 @@ RUN mkdir -p ./temp/to/transcode && chmod 777 ./temp/to/transcode
 # Copy transcode-server binary from build stage
 COPY --from=build /usr/src/transcode-example/transcode_server/target/release/transcode-server .
 
-# Expose ports
-EXPOSE 50051
+# Expose ports. gRPC (50051) only runs with GRPC_ENABLED=true.
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

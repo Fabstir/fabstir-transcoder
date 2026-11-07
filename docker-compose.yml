@@ -96,7 +96,8 @@ services:
       #    is that an armed gate suppresses the shadow path's verdict relay so
       #    only one writer records a verdict per job.
 
-    # Expose the transcoder's gRPC + HTTP ports for local testing
+    # Expose the transcoder's gRPC + HTTP ports for local testing. gRPC only runs with
+    # GRPC_ENABLED=true.
     ports:
       - "50051:50051"
       - "8000:8000"

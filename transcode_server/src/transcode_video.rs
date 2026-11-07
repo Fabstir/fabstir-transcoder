@@ -289,7 +289,10 @@ async fn until_deadline<F: std::future::Future>(
 async fn kill_stalled_child(mut child: tokio::process::Child, limit: Option<Duration>) -> String {
     let _ = child.start_kill();
     let _ = tokio::time::timeout(KILL_WAIT, child.wait()).await;
-    format!("FFmpeg stalled: no progress for {:?}, killed it", limit)
+    format!(
+        "FFmpeg stalled: no progress for {:?}, killed it",
+        limit.unwrap_or_default()
+    )
 }
 
 /// Runs FFmpeg without tying up an async worker, passing each line of its output to
@@ -1266,6 +1269,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("stalled"), "{}", error);
+        assert!(
+            !error.contains("Some"),
+            "written for people to read: {}",
+            error
+        );
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 

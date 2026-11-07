@@ -1,6 +1,6 @@
 # Fabstir Transcoder API Reference
 
-The Fabstir Transcoder exposes a REST API on port **8000** and a gRPC API on port **50051**. Both provide identical transcoding functionality. This document covers both interfaces, authentication, request/response formats, and configuration.
+The Fabstir Transcoder exposes a REST API on port **8000**, and optionally a gRPC API on port **50051**, which is off by default. Both provide identical transcoding functionality. This document covers both interfaces, authentication, request/response formats, and configuration.
 
 ---
 
@@ -352,6 +352,8 @@ Authorization: Bearer <JWT_TOKEN>
 
 ## gRPC API
 
+**Off by default.** Set `GRPC_ENABLED=true` to turn it on. It has no token check, so anything that can reach the port can queue jobs and read results, including CIDs that contain decryption keys. Only turn it on where the port is private.
+
 **Port**: 50051
 **Package**: `transcode`
 **Service**: `TranscodeService`
@@ -482,7 +484,7 @@ One job can't stop the others:
 
 ### Cache and Garbage Collection
 
-The transcoder caches downloaded source files on disk. A job's other files are named after its task, kept only as long as it needs them, and deleted when it ends. A background garbage collector periodically cleans up, oldest files first, never touching a file a running job is using:
+The transcoder caches downloaded source files on disk, except for decrypted copies of encrypted sources, which are deleted as soon as the last job or moderation scan using them ends. A job's other files are named after its task, kept only as long as it needs them, and deleted when it ends. A background garbage collector periodically cleans up, oldest files first, never touching a file a running job is using:
 - **Source cache**: cleaned when total size exceeds `FILE_SIZE_THRESHOLD`
 - **Transcoded files**: cleaned when total size exceeds `TRANSCODED_FILE_SIZE_THRESHOLD`
 - **Interval**: configurable via `GARBAGE_COLLECTOR_INTERVAL` (default: 3600 seconds)
@@ -727,7 +729,8 @@ Configure the transcoder via a `.env` file in the `transcode_server/` directory.
 | `MAX_CONCURRENT_TRANSCODES` | Maximum number of transcode jobs processed simultaneously | `3` |
 | `FFMPEG_STALL_TIMEOUT_SECS` | Kill FFmpeg once its media clock has not moved for this long. `0` turns this off. | `900` (15 minutes) |
 | `JOB_DEADLINE_SECS` | Stop a job that has run for this long since it got a slot. Set it above your longest real job. `0` turns this off. | `86400` (24 hours) |
-| `JOB_RECORD_TTL_SECS` | How long the result of a finished job can still be fetched, before it reads as `404`. | `86400` (24 hours) |
+| `JOB_RECORD_TTL_SECS` | How long the result of a finished job can still be fetched, before it reads as `404`. Results can contain decryption keys, so keep this as short as your clients allow. | `86400` (24 hours) |
+| `GRPC_ENABLED` | Set to `true` to turn on the gRPC API on port 50051, which has no token check. | off |
 | `NVIDIA_DRIVER_CAPABILITIES` | NVIDIA container capabilities | `compute,utility,video` |
 | `PINATA_API_KEY` | Pinata IPFS API key (if using Pinata) | (none) |
 | `PINATA_API_SECRET` | Pinata IPFS API secret | (none) |
@@ -800,8 +803,8 @@ See [`docker-compose.prod.yml`](../docker-compose.prod.yml) for a production-rea
 
 | Port | Protocol | Purpose |
 |---|---|---|
-| 8000 | HTTP/REST | REST API (recommended for most integrations) |
-| 50051 | gRPC | gRPC API (for tonic/protobuf clients) |
+| 8000 | HTTP/REST | REST API. Reach it over a private network, and don't publish it on the host: it has no TLS, and its traffic carries CIDs that contain decryption keys. |
+| 50051 | gRPC | gRPC API, only with `GRPC_ENABLED=true` (see [gRPC API](#grpc-api)) |
 
 ### Health Check
 
@@ -821,6 +824,14 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 - **FFmpeg**: Required (bundled in Docker image)
 - **NVIDIA GPU** (optional): For hardware-accelerated encoding. Requires `nvidia-container-toolkit`.
 - **Network access**: To S5/IPFS gateways for storage operations
+
+### Protecting Content on the Host
+
+An operator with root on a transcoding host can still read keys and video while a job runs, so only vetted hosts should transcode encrypted content. These settings close the easier routes:
+
+- **Decrypted files off permanent storage:** mount `PATH_TO_FILE` and `PATH_TO_TRANSCODED_FILE` on a disk encrypted with a random key generated at each boot, for example with `crypttab` in plain mode and `/dev/urandom`. Its contents can't be read after a reboot, or from a stolen disk or backup. Swap should be off or encrypted the same way.
+- **A locked-down container:** `docker-compose.prod.yml` runs it as UID 1000, with a read-only filesystem, no extra privileges and no core dumps. Storage volumes must be writable by that UID. If they aren't, the server exits at startup and names the path.
+- **Private ports:** see [Ports](#ports).
 
 ---
 
