@@ -1453,6 +1453,8 @@ fn apply_cid_metadata(
     is_hls: bool,
     dest: &Option<String>,
 ) {
+    // Measured from the output, so that each format can be billed by its own length.
+    video_format_modified["encodedDuration"] = json!(response.duration);
     if is_hls {
         if let Ok(hls_result) = serde_json::from_str::<Value>(&response.cid) {
             video_format_modified["hls"] = json!(true);
@@ -1519,18 +1521,23 @@ fn storage_dir(path: &str) -> String {
     }
 }
 
+/// The file-name prefix of a storage path: empty for a directory, `prefix_` for
+/// `/dir/prefix_`. Files are named this, followed by what the job calls them.
+fn storage_prefix(path: &str) -> String {
+    if path.ends_with('/') || Path::new(path).is_dir() {
+        return String::new();
+    }
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// What a storage path holds, as (path, metadata). Paths are spelled the way jobs
 /// spell them, because a GC pin only protects an exact match.
 fn storage_entries(path: &str) -> std::io::Result<Vec<(std::path::PathBuf, fs::Metadata)>> {
-    let as_prefix = !path.ends_with('/') && !Path::new(path).is_dir();
-    let prefix = if as_prefix {
-        Path::new(path)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let prefix = storage_prefix(path);
+    let as_prefix = !prefix.is_empty();
     let dir = if as_prefix {
         storage_dir(path)
     } else {
@@ -1663,7 +1670,14 @@ fn is_leftover(name: &str, is_dir: bool) -> bool {
     }
 }
 
-/// Runs once at startup, when no job of this process can be using these files.
+/// What running jobs leave, removed just before the process exits: exiting skips their
+/// own clean-up, and a stopped container may not start again for a long time.
+fn remove_leftovers() {
+    sweep_leftovers(PATH_TO_FILE.as_str());
+    sweep_leftovers(PATH_TO_TRANSCODED_FILE.as_str());
+}
+
+/// Runs at startup, when no job of this process can be using these files, and at exit.
 fn sweep_leftovers(path: &str) {
     let entries = match storage_entries(path) {
         Ok(entries) => entries,
@@ -1672,12 +1686,15 @@ fn sweep_leftovers(path: &str) {
             return;
         }
     };
+    let prefix = storage_prefix(path);
     for (entry_path, meta) in entries {
         let name = entry_path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if !is_leftover(&name, meta.is_dir()) {
+        // The name the job gave it: a hashed source name only matches without the prefix.
+        let given = name.strip_prefix(prefix.as_str()).unwrap_or(&name);
+        if !is_leftover(given, meta.is_dir()) {
             continue;
         }
         let removed = if meta.is_dir() {
@@ -1889,9 +1906,11 @@ async fn main() {
         result = rest_server => eprintln!("FATAL: REST server ended: {:?}", result),
         _ = terminate_requested() => {
             println!("Stopping: asked to by SIGTERM");
+            remove_leftovers();
             std::process::exit(0);
         }
     }
+    remove_leftovers();
     std::process::exit(1);
 }
 
@@ -5168,8 +5187,21 @@ mod tests {
         let dir = gc_test_dir("sweep-prefix");
         std::fs::write(dir.join("src_x.part"), b"x").unwrap();
         std::fs::write(dir.join("other.part"), b"x").unwrap();
+        // How host1 and host2 name a decrypted source: the prefix, then the hash.
+        let decrypted = format!("src_{}", "ab".repeat(32));
+        std::fs::write(dir.join(&decrypted), b"x").unwrap();
+        let plain = "src_uPlainCachedSource";
+        std::fs::write(dir.join(plain), b"x").unwrap();
         sweep_leftovers(dir.join("src_").to_str().unwrap());
         assert!(!dir.join("src_x.part").exists());
+        assert!(
+            !dir.join(&decrypted).exists(),
+            "a decrypted copy left by a crash"
+        );
+        assert!(
+            dir.join(plain).exists(),
+            "a plain source is a cache worth keeping"
+        );
         assert!(dir.join("other.part").exists(), "outside the prefix");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5249,6 +5281,60 @@ mod tests {
             .expect("main");
         let select = main_body.find("tokio::select!").expect("select");
         assert!(main_body[select..].contains("terminate_requested()"));
+    }
+
+    /// Exiting at once skips each job's own clean-up, so what they leave has to go before
+    /// the process does: a stopped container may not start again for a long time.
+    #[test]
+    fn test_stopping_removes_what_running_jobs_leave_before_exiting() {
+        let main_body = job_flow_src()
+            .split("async fn main() {")
+            .nth(1)
+            .expect("main");
+        let arm = main_body
+            .find("terminate_requested()")
+            .expect("the SIGTERM arm");
+        let arm = &main_body[arm..];
+        let exit = arm.find("std::process::exit(0)").expect("exits");
+        let clean = arm.find("remove_leftovers()").expect("cleans up");
+        assert!(clean < exit, "clean up first, then exit");
+    }
+
+    /// The node bills each format by its own length.
+    #[tokio::test]
+    async fn test_each_published_format_carries_its_own_length() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let _uploads = UPLOAD_TEST_LOCK.lock().await;
+        let full = r#"{"id":1,"ext":"mp4","vcodec":"libx264","vf":"scale=32:32"}"#;
+        let preview =
+            r#"{"id":2,"ext":"mp4","vcodec":"libx264","vf":"scale=16:16","trim_percent":20}"#;
+        let hls = r#"{"id":3,"ext":"mp4","vcodec":"libx264","hls":true,"hls_time":1}"#;
+        for gate in [GateMode::Off, GateMode::Enforce] {
+            let (source, _) = serve_source(sample_video());
+            let (client, _) = recording(ModerationOutcome::Cleared);
+            let formats = format!("[{},{},{}]", full, preview, hls);
+            let end = run_job_with(&source, &formats, false, gate, client).await;
+            assert_eq!(end.status_code, 200, "{}", end.metadata);
+            let published: Vec<Value> = serde_json::from_str(&end.metadata).unwrap();
+            let length = |id: u64| {
+                published
+                    .iter()
+                    .find(|f| f["id"] == id)
+                    .and_then(|f| f["encodedDuration"].as_f64())
+                    .unwrap_or_else(|| panic!("{:?}: no length on format {}", gate, id))
+            };
+            assert!(is_about_three_seconds(length(1)), "{}", length(1));
+            assert!(
+                (length(2) - 0.6).abs() < 0.2,
+                "the preview's own length: {}",
+                length(2)
+            );
+            assert!(is_about_three_seconds(length(3)), "{}", length(3));
+            let longest = length(1).max(length(2)).max(length(3));
+            assert_eq!(end.duration, longest, "the job's is the longest");
+        }
     }
 
     /// `supervise` turns a panic into a failed job only by catching the unwind.

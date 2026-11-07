@@ -272,10 +272,13 @@ When `progress` reaches 100, the `metadata` field contains a JSON array string. 
     "b_v": "3.5M",
     "ar": "48k",
     "gpu": true,
+    "encodedDuration": 125.5,
     "cid": "s5://bafkqaavepzrspnpfq5mctcxmz23wuv6iayuq"
   }
 ]
 ```
+
+Each format object also has an `encodedDuration`: the length of that output in seconds, measured from the output itself. A preview made with `trim_percent` reports its own, shorter length.
 
 The `cid` field on each format object is the content identifier of the transcoded output:
 - `s5://<hash>` — stored on S5 (Sia) network (default)
